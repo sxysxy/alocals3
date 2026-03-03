@@ -1,57 +1,91 @@
+[简体中文](README.zh-CN.md)
+
 # alocals3
 
-基于 FastAPI 的本地文件系统 S3 风格服务（项目骨架）。
+A local-storage-based S3-like service (server + client) powered by FastAPI.
 
-## 快速启动
+## Quick Start
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python -m alocals3.server --reload
-# 或者通过命令行覆盖数据库连接串
+# override DB URL from CLI
 python -m alocals3.server --database-url "sqlite:////absolute/path/alocals3.db" --reload
 ```
 
-## 配置
+## Configuration
 
-- `ALOCALS3_APP_NAME`: 应用名，默认 `alocals3`
-- `ALOCALS3_STORAGE_ROOT`: 本地对象数据目录，默认 `./data`
-- `ALOCALS3_DATABASE_URL`: 数据库连接串，默认 `sqlite:///./alocals3.db`
+- `ALOCALS3_APP_NAME`: app name, default `alocals3`
+- `ALOCALS3_STORAGE_ROOT`: object storage root, default `./data`
+- `ALOCALS3_DATABASE_URL`: database URL, default `sqlite:///./alocals3.db`
 
-示例：
+Examples:
 
 - SQLite: `sqlite:///./alocals3.db`
 - PostgreSQL: `postgresql+psycopg://user:password@127.0.0.1:5432/alocals3`
 
-说明：SQLite 连接串建议使用绝对路径，避免因启动目录不同导致读写到不同数据库文件。
+Note: for SQLite, prefer an absolute path to avoid writing to different DB files due to different working directories.
 
-## 存储策略
+## Storage Strategy
 
-- key/元数据索引存放在数据库（SQLAlchemy，支持 SQLite/PostgreSQL）
-- 对象内容存放在本地磁盘
-- 文件路径使用 hash 分片：
+- Key/object metadata is indexed in DB (SQLAlchemy, supports SQLite/PostgreSQL)
+- Object payload is stored on local disk
+- Blob file path uses hash sharding:
   - `sha256(<object bytes>) = <digest>`
-  - 文件落盘路径为：`{storage_root}/objects/{digest[:2]}/{digest[2:4]}/{digest}`
+  - `{storage_root}/objects/{digest[:2]}/{digest[2:4]}/{digest}`
 
-## API 骨架
+## API Overview
 
-- `GET /healthz`: 健康检查
-- `GET /s3`: 列出 buckets
-- `PUT /s3/{bucket}`: 创建 bucket
-- `DELETE /s3/{bucket}`: 删除空 bucket
-- `GET /s3/{bucket}/objects`: 列出对象
-- `PUT /s3/{bucket}/{key}`: 上传对象
-- `GET /s3/{bucket}/{key}`: 下载对象（支持 `304`）
-- `HEAD /s3/{bucket}/{key}`: 只取元信息（支持 `304`）
-- `DELETE /s3/{bucket}/{key}`: 删除对象
+- `GET /healthz`: health check
+- `GET /s3`: list buckets
+- `PUT /s3/{bucket}`: create bucket
+- `DELETE /s3/{bucket}`: delete empty bucket
+- `GET /s3/{bucket}/objects`: list objects
+- `PUT /s3/{bucket}/{key}`: upload object
+- `GET /s3/{bucket}/{key}`: download object (supports `304`(Not Modified”), `Range` => `206/416`(Partial Content/Request Range Not Satisfiable))
+- `HEAD /s3/{bucket}/{key}`: metadata only (supports `304`(Not Modified”))
+- `DELETE /s3/{bucket}/{key}`: delete object
 
-## 一致性与原子性
+## Partial Content Examples
 
-- `PUT`: 对象文件通过临时文件 + `os.replace` 原子替换，避免读到半写入内容；对象元数据映射通过数据库事务提交。
-- `DELETE`: 对象元数据删除在数据库事务内完成（请求路径不做物理文件删除，以缩小临界区并避免并发竞态）。
-- 以上不是“数据库与文件系统跨存储的单一全局事务”，极端故障下可能产生孤儿文件（可通过离线 GC 回收）。
+```bash
+# first 100 bytes
+curl -i -H "Range: bytes=0-99" http://127.0.0.1:8000/s3/demo/video.bin
 
-### LICENSE
+# last 512 bytes
+curl -i -H "Range: bytes=-512" http://127.0.0.1:8000/s3/demo/video.bin
+
+# client CLI
+python -m alocals3.client --endpoint http://127.0.0.1:8000 \
+  get demo video.bin ./part.bin --range "bytes=0-99"
+```
+
+```python
+from pathlib import Path
+from alocals3.client import LocalS3Client
+
+client = LocalS3Client("http://127.0.0.1:8000")
+data, headers = client.get_object_range("demo", "video.bin", "bytes=0-99")
+print(len(data), headers.get("content-range"))
+
+headers = client.get_object_to_file(
+    "demo",
+    "video.bin",
+    Path("./part.bin"),
+    range_header="bytes=100-199",
+)
+print(headers.get("content-range"))
+client.close()
+```
+
+## Consistency and Atomicity
+
+- `PUT`: atomic blob replacement via temp file + `os.replace`; metadata mapping committed in DB transaction.
+- `DELETE`: metadata mapping deletion is transactional in DB (physical blob deletion is intentionally out of request path to minimize critical section and avoid races).
+- This is not a single global transaction across DB + filesystem. Under extreme failures, orphan blobs may exist and can be reclaimed by offline GC.
+
+## License
 
 [The MIT License](LICENSE)

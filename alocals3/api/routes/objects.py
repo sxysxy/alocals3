@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from email.utils import format_datetime, parsedate_to_datetime
 
-from fastapi import APIRouter, Depends, Query, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
 from alocals3.api.deps import get_storage
 from alocals3.schemas.storage import ObjectInfo, StoredObject
@@ -47,9 +47,11 @@ def delete_object(bucket: str, key: str, storage: LocalStorageBackend = Depends(
 
 
 def _conditional_object_response(obj: StoredObject, request: Request, include_body: bool) -> Response:
+    body_len = len(obj.body)
     headers = {
         "ETag": f'"{obj.etag}"',
         "Last-Modified": _http_date(obj.updated_at),
+        "Accept-Ranges": "bytes",
     }
 
     if_none_match = request.headers.get("if-none-match")
@@ -63,6 +65,20 @@ def _conditional_object_response(obj: StoredObject, request: Request, include_bo
             last_updated = _to_utc(obj.updated_at).replace(microsecond=0)
             if last_updated <= modified_since.replace(microsecond=0):
                 return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+
+    range_header = request.headers.get("range")
+    if range_header:
+        start, end = _parse_single_range(range_header, body_len)
+        partial = obj.body[start : end + 1]
+        headers["Content-Range"] = f"bytes {start}-{end}/{body_len}"
+        if include_body:
+            return Response(
+                status_code=status.HTTP_206_PARTIAL_CONTENT,
+                content=partial,
+                media_type=obj.content_type,
+                headers=headers,
+            )
+        return Response(status_code=status.HTTP_206_PARTIAL_CONTENT, media_type=obj.content_type, headers=headers)
 
     if include_body:
         return Response(content=obj.body, media_type=obj.content_type, headers=headers)
@@ -102,3 +118,93 @@ def _parse_http_date(value: str) -> datetime | None:
     if parsed is None:
         return None
     return _to_utc(parsed)
+
+
+def _parse_single_range(range_header: str, total_size: int) -> tuple[int, int]:
+    if total_size <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+            detail="Range not satisfiable",
+            headers={"Content-Range": "bytes */0"},
+        )
+
+    if not range_header.startswith("bytes="):
+        raise HTTPException(
+            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+            detail="Invalid range unit",
+            headers={"Content-Range": f"bytes */{total_size}"},
+        )
+
+    # Only single-range requests are supported.
+    raw = range_header[len("bytes=") :].strip()
+    if "," in raw:
+        raise HTTPException(
+            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+            detail="Multiple ranges are not supported",
+            headers={"Content-Range": f"bytes */{total_size}"},
+        )
+
+    if "-" not in raw:
+        raise HTTPException(
+            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+            detail="Invalid range format",
+            headers={"Content-Range": f"bytes */{total_size}"},
+        )
+
+    start_raw, end_raw = raw.split("-", 1)
+
+    # suffix-byte-range-spec: bytes=-N
+    if not start_raw:
+        try:
+            suffix_len = int(end_raw)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                detail="Invalid range value",
+                headers={"Content-Range": f"bytes */{total_size}"},
+            )
+        if suffix_len <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                detail="Invalid range value",
+                headers={"Content-Range": f"bytes */{total_size}"},
+            )
+        if suffix_len >= total_size:
+            return 0, total_size - 1
+        return total_size - suffix_len, total_size - 1
+
+    try:
+        start = int(start_raw)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+            detail="Invalid range value",
+            headers={"Content-Range": f"bytes */{total_size}"},
+        )
+
+    if start < 0 or start >= total_size:
+        raise HTTPException(
+            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+            detail="Range start out of bounds",
+            headers={"Content-Range": f"bytes */{total_size}"},
+        )
+
+    if end_raw:
+        try:
+            end = int(end_raw)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                detail="Invalid range value",
+                headers={"Content-Range": f"bytes */{total_size}"},
+            )
+        if end < start:
+            raise HTTPException(
+                status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                detail="Invalid range value",
+                headers={"Content-Range": f"bytes */{total_size}"},
+            )
+        end = min(end, total_size - 1)
+        return start, end
+
+    return start, total_size - 1

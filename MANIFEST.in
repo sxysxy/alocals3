@@ -1,3 +1,4 @@
 include README.md
+include README.zh-CN.md
 include LICENSE
 global-exclude __pycache__ *.py[cod]

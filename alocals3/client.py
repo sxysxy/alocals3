@@ -60,6 +60,27 @@ class LocalS3Client:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(response.content)
 
+    def get_object_range(self, bucket: str, key: str, range_header: str) -> tuple[bytes, dict]:
+        response = self._client.get(f"/s3/{bucket}/{key}", headers={"range": range_header})
+        response.raise_for_status()
+        return response.content, dict(response.headers)
+
+    def get_object_to_file(
+        self,
+        bucket: str,
+        key: str,
+        output_path: Path,
+        range_header: str | None = None,
+    ) -> dict:
+        headers: dict[str, str] = {}
+        if range_header:
+            headers["range"] = range_header
+        response = self._client.get(f"/s3/{bucket}/{key}", headers=headers)
+        response.raise_for_status()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(response.content)
+        return dict(response.headers)
+
     def delete_object(self, bucket: str, key: str) -> None:
         response = self._client.delete(f"/s3/{bucket}/{key}")
         response.raise_for_status()
@@ -99,6 +120,7 @@ def _build_parser() -> argparse.ArgumentParser:
     get.add_argument("bucket")
     get.add_argument("key")
     get.add_argument("output", help="Output file path")
+    get.add_argument("--range", dest="range_header", default=None, help='HTTP Range header value, e.g. "bytes=0-99"')
 
     rm = subparsers.add_parser("rm", help="Delete object")
     rm.add_argument("bucket")
@@ -140,8 +162,12 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         elif args.command == "get":
             output_path = Path(args.output)
-            client.get_object(args.bucket, args.key, output_path)
-            print(f"downloaded to: {output_path}")
+            headers = client.get_object_to_file(args.bucket, args.key, output_path, range_header=args.range_header)
+            content_range = headers.get("content-range")
+            if content_range:
+                print(f"downloaded range to: {output_path} ({content_range})")
+            else:
+                print(f"downloaded to: {output_path}")
         elif args.command == "rm":
             client.delete_object(args.bucket, args.key)
             print(f"deleted object: {args.bucket}/{args.key}")

@@ -6,3 +6,4 @@ dist
 alocals3.db
 data
 examples/.tmp
+.DS_Store

@@ -37,10 +37,11 @@ postgres = [
 ]
 
 [project.urls]
-Homepage = "https://example.com/alocals3"
-Repository = "https://example.com/alocals3"
+Homepage = "https://github.com/sxysxy/alocals3"
+Repository = "https://github.com/sxysxy/alocals3"
 
 [project.scripts]
+alocals3-server = "alocals3.server:main"
 alocals3-client = "alocals3.client:main"
 
 [tool.setuptools]

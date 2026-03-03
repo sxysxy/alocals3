@@ -1,0 +1,8 @@
+__pycache__
+*.pyc
+build
+dist
+*.egg-info
+alocals3.db
+data
+examples/.tmp

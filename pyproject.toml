@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alocals3"
+version = "0.1.0"
+description = "alocals3: A local-storage based S3-like service(including server and client), powered by FastAPI"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+  { name = "alocals3 contributors" }
+]
+keywords = ["s3", "fastapi", "local"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Framework :: FastAPI",
+]
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn>=0.30.0",
+  "httpx>=0.27.0",
+  "pydantic>=2.8.0",
+  "sqlalchemy>=2.0.0",
+]
+
+[project.optional-dependencies]
+postgres = [
+  "psycopg[binary]>=3.1.0",
+]
+
+[project.urls]
+Homepage = "https://example.com/alocals3"
+Repository = "https://example.com/alocals3"
+
+[project.scripts]
+alocals3-client = "alocals3.client:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["alocals3*"]
+exclude = ["examples*", "tests*"]

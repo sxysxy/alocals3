@@ -45,6 +45,27 @@ class LocalS3Client:
         response.raise_for_status()
         return response.json()
 
+    def list_objects_v2(
+        self,
+        bucket: str,
+        prefix: str = "",
+        delimiter: str = "",
+        max_keys: int = 1000,
+        continuation_token: str | None = None,
+    ) -> dict:
+        params: dict[str, str | int] = {
+            "list-type": 2,
+            "prefix": prefix,
+            "delimiter": delimiter,
+            "max-keys": max_keys,
+            "output": "json",
+        }
+        if continuation_token:
+            params["continuation-token"] = continuation_token
+        response = self._client.get(f"/s3/{bucket}", params=params)
+        response.raise_for_status()
+        return response.json()
+
     def put_object(self, bucket: str, key: str, file_path: Path, content_type: str | None = None) -> dict:
         body = file_path.read_bytes()
         headers: dict[str, str] = {}
@@ -96,33 +117,40 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("health", help="Check server health")
-    subparsers.add_parser("lsb", help="List buckets")
+    subparsers.add_parser("HEALTH", aliases=["health"], help="Check server health")
+    subparsers.add_parser("LIST_BUCKETS", aliases=["lsb"], help="List buckets")
 
-    mb = subparsers.add_parser("mb", help="Create bucket")
+    mb = subparsers.add_parser("CREATE_BUCKET", aliases=["mb"], help="Create bucket")
     mb.add_argument("bucket")
 
-    rb = subparsers.add_parser("rb", help="Delete empty bucket")
+    rb = subparsers.add_parser("DELETE_BUCKET", aliases=["rb"], help="Delete empty bucket")
     rb.add_argument("bucket")
 
-    lso = subparsers.add_parser("lso", help="List objects in bucket")
+    lso = subparsers.add_parser("LIST_OBJECTS", aliases=["lso"], help="List objects in bucket")
     lso.add_argument("bucket")
     lso.add_argument("--prefix", default=None)
     lso.add_argument("--limit", type=int, default=1000)
 
-    put = subparsers.add_parser("put", help="Upload object")
+    lso2 = subparsers.add_parser("LIST_OBJECTS_V2", help="List objects using S3 ListObjectsV2 semantics")
+    lso2.add_argument("bucket")
+    lso2.add_argument("--prefix", default="")
+    lso2.add_argument("--delimiter", default="")
+    lso2.add_argument("--max-keys", type=int, default=1000)
+    lso2.add_argument("--continuation-token", default=None)
+
+    put = subparsers.add_parser("PUT", aliases=["put"], help="Upload object")
     put.add_argument("bucket")
     put.add_argument("key")
     put.add_argument("file", help="Local file path")
     put.add_argument("--content-type", default=None)
 
-    get = subparsers.add_parser("get", help="Download object")
+    get = subparsers.add_parser("GET", aliases=["get"], help="Download object")
     get.add_argument("bucket")
     get.add_argument("key")
     get.add_argument("output", help="Output file path")
     get.add_argument("--range", dest="range_header", default=None, help='HTTP Range header value, e.g. "bytes=0-99"')
 
-    rm = subparsers.add_parser("rm", help="Delete object")
+    rm = subparsers.add_parser("DELETE", aliases=["rm"], help="Delete object")
     rm.add_argument("bucket")
     rm.add_argument("key")
 
@@ -138,20 +166,42 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
+    cmd_map = {
+        "health": "HEALTH",
+        "lsb": "LIST_BUCKETS",
+        "mb": "CREATE_BUCKET",
+        "rb": "DELETE_BUCKET",
+        "lso": "LIST_OBJECTS",
+        "LIST_OBJECTS_V2": "LIST_OBJECTS_V2",
+        "put": "PUT",
+        "get": "GET",
+        "rm": "DELETE",
+    }
+    command = cmd_map.get(args.command, args.command)
+
     try:
-        if args.command == "health":
+        if command == "HEALTH":
             print(json.dumps(client.health(), ensure_ascii=False, indent=2))
-        elif args.command == "lsb":
+        elif command == "LIST_BUCKETS":
             print(json.dumps(client.list_buckets(), ensure_ascii=False, indent=2))
-        elif args.command == "mb":
+        elif command == "CREATE_BUCKET":
             print(json.dumps(client.create_bucket(args.bucket), ensure_ascii=False, indent=2))
-        elif args.command == "rb":
+        elif command == "DELETE_BUCKET":
             client.delete_bucket(args.bucket)
             print(f"deleted bucket: {args.bucket}")
-        elif args.command == "lso":
+        elif command == "LIST_OBJECTS":
             objects = client.list_objects(args.bucket, prefix=args.prefix, limit=args.limit)
             print(json.dumps(objects, ensure_ascii=False, indent=2))
-        elif args.command == "put":
+        elif command == "LIST_OBJECTS_V2":
+            result = client.list_objects_v2(
+                bucket=args.bucket,
+                prefix=args.prefix,
+                delimiter=args.delimiter,
+                max_keys=args.max_keys,
+                continuation_token=args.continuation_token,
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif command == "PUT":
             file_path = Path(args.file)
             result = client.put_object(
                 bucket=args.bucket,
@@ -160,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
                 content_type=args.content_type,
             )
             print(json.dumps(result, ensure_ascii=False, indent=2))
-        elif args.command == "get":
+        elif command == "GET":
             output_path = Path(args.output)
             headers = client.get_object_to_file(args.bucket, args.key, output_path, range_header=args.range_header)
             content_range = headers.get("content-range")
@@ -168,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"downloaded range to: {output_path} ({content_range})")
             else:
                 print(f"downloaded to: {output_path}")
-        elif args.command == "rm":
+        elif command == "DELETE":
             client.delete_object(args.bucket, args.key)
             print(f"deleted object: {args.bucket}/{args.key}")
         else:

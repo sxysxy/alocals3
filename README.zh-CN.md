@@ -41,10 +41,49 @@ python -m alocals3.server --database-url "sqlite:////absolute/path/alocals3.db" 
 - `PUT /s3/{bucket}`: 创建 bucket
 - `DELETE /s3/{bucket}`: 删除空 bucket
 - `GET /s3/{bucket}/objects`: 列出对象
+- `GET /s3/{bucket}?list-type=2`: S3 风格 ListObjectsV2（支持 `prefix`、`delimiter`、`max-keys`、`continuation-token`）
 - `PUT /s3/{bucket}/{key}`: 上传对象
-- `GET /s3/{bucket}/{key}`: 下载对象（支持 `304`（Not Modified 客户端缓存），支持 `Range` 返回 `206/416`（Partial Content 部分内容/Request Range Not Satisfiable 无法满足请求的范围））
-- `HEAD /s3/{bucket}/{key}`: 只取元信息（支持 `304`（Not Modified 客户端缓存））
+- `GET /s3/{bucket}/{key}`: 下载对象（支持 `304`，支持 `Range` 返回 `206/416`）
+- `HEAD /s3/{bucket}/{key}`: 只取元信息（支持 `304`，支持 `Range` 返回 `206/416`）
 - `DELETE /s3/{bucket}/{key}`: 删除对象
+
+## 条件 PUT 与完整性校验
+
+`PUT /s3/{bucket}/{key}` 支持：
+
+- `If-None-Match`：当 ETag 匹配时拒绝覆盖（支持 `*`）
+- `If-Match`：仅当 ETag 匹配时允许覆盖
+- `Content-MD5`：服务端校验上传内容摘要，不匹配返回 `400 BadDigest`
+
+返回码：
+
+- `201`：新建对象
+- `200`：覆盖已有对象
+- `412`：前置条件失败
+
+```bash
+# 仅当对象不存在时创建
+curl -i -X PUT -H "If-None-Match: *" --data-binary @file.bin \
+  http://127.0.0.1:8000/s3/demo/file.bin
+
+# 仅当 ETag 匹配时覆盖
+curl -i -X PUT -H 'If-Match: "d41d8cd98f00b204e9800998ecf8427e"' --data-binary @file.bin \
+  http://127.0.0.1:8000/s3/demo/file.bin
+
+# 携带 Content-MD5 校验
+MD5_B64=$(openssl md5 -binary file.bin | openssl base64)
+curl -i -X PUT -H "Content-MD5: ${MD5_B64}" --data-binary @file.bin \
+  http://127.0.0.1:8000/s3/demo/file.bin
+```
+
+## ListObjectsV2 示例
+
+```bash
+curl -sS "http://127.0.0.1:8000/s3/demo?list-type=2&prefix=logs/&delimiter=/&max-keys=100"
+
+python -m alocals3.client --endpoint http://127.0.0.1:8000 \
+  LIST_OBJECTS_V2 demo --prefix logs/ --delimiter / --max-keys 100
+```
 
 ## Partial Content 用法示例
 
@@ -57,7 +96,7 @@ curl -i -H "Range: bytes=-512" http://127.0.0.1:8000/s3/demo/video.bin
 
 # client CLI
 python -m alocals3.client --endpoint http://127.0.0.1:8000 \
-  get demo video.bin ./part.bin --range "bytes=0-99"
+  GET demo video.bin ./part.bin --range "bytes=0-99"
 ```
 
 ```python
@@ -84,6 +123,23 @@ client.close()
 - `DELETE`: 对象元数据删除在数据库事务内完成（请求路径不做物理文件删除，以缩小临界区并避免并发竞态）。
 - 以上不是“数据库与文件系统跨存储的单一全局事务”，极端故障下可能产生孤儿文件（可通过离线 GC 回收）。
 
-### LICENSE
+## 离线 GC
+
+```bash
+# 仅扫描
+python -m alocals3.gc
+
+# 删除孤儿文件
+python -m alocals3.gc --apply
+
+# 安装后可直接执行
+alocals3-gc --apply
+```
+
+## 更新记录
+
+[updates.md](updates.md)
+
+## LICENSE
 
 [The MIT License](LICENSE)

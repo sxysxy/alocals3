@@ -16,26 +16,26 @@ DST_FILE="$WORK_DIR/downloaded.txt"
 echo "hello from alocals3 at $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$SRC_FILE"
 
 echo "[1/7] health"
-python -m alocals3.client --endpoint "$ENDPOINT" health
+python -m alocals3.client --endpoint "$ENDPOINT" HEALTH
 
 echo "[2/7] create bucket: $BUCKET"
-python -m alocals3.client --endpoint "$ENDPOINT" mb "$BUCKET" >/dev/null 2>&1 || true
+python -m alocals3.client --endpoint "$ENDPOINT" CREATE_BUCKET "$BUCKET" >/dev/null 2>&1 || true
 
 echo "[3/7] put object: $BUCKET/$KEY"
-python -m alocals3.client --endpoint "$ENDPOINT" put "$BUCKET" "$KEY" "$SRC_FILE" --content-type text/plain
+python -m alocals3.client --endpoint "$ENDPOINT" PUT "$BUCKET" "$KEY" "$SRC_FILE" --content-type text/plain
 
 echo "[4/7] list buckets"
-python -m alocals3.client --endpoint "$ENDPOINT" lsb
+python -m alocals3.client --endpoint "$ENDPOINT" LIST_BUCKETS
 
 echo "[5/7] list objects"
-python -m alocals3.client --endpoint "$ENDPOINT" lso "$BUCKET"
+python -m alocals3.client --endpoint "$ENDPOINT" LIST_OBJECTS "$BUCKET"
 
 echo "[6/7] download object"
-python -m alocals3.client --endpoint "$ENDPOINT" get "$BUCKET" "$KEY" "$DST_FILE"
+python -m alocals3.client --endpoint "$ENDPOINT" GET "$BUCKET" "$KEY" "$DST_FILE"
 cat "$DST_FILE"
 
 echo "[7/7] cleanup"
-python -m alocals3.client --endpoint "$ENDPOINT" rm "$BUCKET" "$KEY"
-python -m alocals3.client --endpoint "$ENDPOINT" rb "$BUCKET"
+python -m alocals3.client --endpoint "$ENDPOINT" DELETE "$BUCKET" "$KEY"
+python -m alocals3.client --endpoint "$ENDPOINT" DELETE_BUCKET "$BUCKET"
 
 echo "done"

@@ -70,7 +70,78 @@ class LocalStorageBackend:
             rows = session.scalars(stmt).all()
             return [self._to_object_info(bucket_row.name, row) for row in rows]
 
+    def list_objects_v2(
+        self,
+        bucket: str,
+        prefix: str = "",
+        delimiter: str = "",
+        max_keys: int = 1000,
+        continuation_token: str | None = None,
+    ) -> dict:
+        self._validate_bucket(bucket)
+        if max_keys < 1:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="max_keys must be >= 1")
+
+        with self.session_factory() as session:
+            bucket_row = self._get_bucket_or_404(session, bucket)
+            stmt = select(ObjectModel).where(ObjectModel.bucket_id == bucket_row.id)
+            if prefix:
+                stmt = stmt.where(ObjectModel.key.startswith(prefix))
+            if continuation_token:
+                stmt = stmt.where(ObjectModel.key > continuation_token)
+            stmt = stmt.order_by(ObjectModel.key.asc())
+
+            rows = session.scalars(stmt).all()
+            contents: list[ObjectInfo] = []
+            common_prefixes: list[str] = []
+            common_prefix_set: set[str] = set()
+            key_count = 0
+            next_token: str | None = None
+
+            for row in rows:
+                key = row.key
+                if delimiter:
+                    tail = key[len(prefix) :] if prefix and key.startswith(prefix) else key
+                    if delimiter in tail:
+                        cp = key[: len(prefix) + tail.find(delimiter) + 1]
+                        if cp not in common_prefix_set:
+                            if key_count >= max_keys:
+                                next_token = key
+                                break
+                            common_prefix_set.add(cp)
+                            common_prefixes.append(cp)
+                            key_count += 1
+                        continue
+
+                if key_count >= max_keys:
+                    next_token = key
+                    break
+                contents.append(self._to_object_info(bucket_row.name, row))
+                key_count += 1
+
+            return {
+                "bucket": bucket_row.name,
+                "prefix": prefix,
+                "delimiter": delimiter,
+                "max_keys": max_keys,
+                "key_count": key_count,
+                "is_truncated": next_token is not None,
+                "next_continuation_token": next_token,
+                "contents": contents,
+                "common_prefixes": common_prefixes,
+            }
+
     def put_object(self, bucket: str, key: str, body: bytes, content_type: str | None = None) -> ObjectInfo:
+        info, _ = self.put_object_with_state(bucket=bucket, key=key, body=body, content_type=content_type)
+        return info
+
+    def put_object_with_state(
+        self,
+        bucket: str,
+        key: str,
+        body: bytes,
+        content_type: str | None = None,
+    ) -> tuple[ObjectInfo, bool]:
         self._validate_bucket(bucket)
         normalized_key = self._normalize_key(key)
         now = datetime.now(tz=timezone.utc)
@@ -88,6 +159,7 @@ class LocalStorageBackend:
 
             new_path = relative_path.as_posix()
             row: ObjectModel | None = None
+            created = False
 
             for attempt in range(2):
                 try:
@@ -99,6 +171,7 @@ class LocalStorageBackend:
                     )
 
                     if existing is None:
+                        created = True
                         row = ObjectModel(
                             bucket_id=bucket_row.id,
                             key=normalized_key,
@@ -133,7 +206,7 @@ class LocalStorageBackend:
             session.refresh(row)
             result = self._to_object_info(bucket_row.name, row)
 
-        return result
+        return result, created
 
     def get_object(self, bucket: str, key: str) -> StoredObject:
         self._validate_bucket(bucket)
@@ -175,6 +248,22 @@ class LocalStorageBackend:
             # Atomic delete on metadata mapping (critical section kept in DB transaction).
             session.delete(row)
             session.commit()
+
+    def get_object_info(self, bucket: str, key: str) -> ObjectInfo | None:
+        self._validate_bucket(bucket)
+        normalized_key = self._normalize_key(key)
+
+        with self.session_factory() as session:
+            bucket_row = self._get_bucket_or_404(session, bucket)
+            row = session.scalar(
+                select(ObjectModel).where(
+                    ObjectModel.bucket_id == bucket_row.id,
+                    ObjectModel.key == normalized_key,
+                )
+            )
+            if row is None:
+                return None
+            return self._to_object_info(bucket_row.name, row)
 
     def _get_bucket_or_404(self, session: Session, bucket: str) -> BucketModel:
         row = session.scalar(select(BucketModel).where(BucketModel.name == bucket))

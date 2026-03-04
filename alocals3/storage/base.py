@@ -18,10 +18,32 @@ class StorageBackend(Protocol):
     def list_objects(self, bucket: str, prefix: str | None = None, limit: int = 1000) -> list[ObjectInfo]:
         ...
 
+    def list_objects_v2(
+        self,
+        bucket: str,
+        prefix: str = "",
+        delimiter: str = "",
+        max_keys: int = 1000,
+        continuation_token: str | None = None,
+    ) -> dict:
+        ...
+
     def put_object(self, bucket: str, key: str, body: bytes, content_type: str | None = None) -> ObjectInfo:
         ...
 
+    def put_object_with_state(
+        self,
+        bucket: str,
+        key: str,
+        body: bytes,
+        content_type: str | None = None,
+    ) -> tuple[ObjectInfo, bool]:
+        ...
+
     def get_object(self, bucket: str, key: str) -> StoredObject:
+        ...
+
+    def get_object_info(self, bucket: str, key: str) -> ObjectInfo | None:
         ...
 
     def delete_object(self, bucket: str, key: str) -> None:

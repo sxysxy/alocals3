@@ -43,10 +43,49 @@ Note: for SQLite, prefer an absolute path to avoid writing to different DB files
 - `PUT /s3/{bucket}`: create bucket
 - `DELETE /s3/{bucket}`: delete empty bucket
 - `GET /s3/{bucket}/objects`: list objects
+- `GET /s3/{bucket}?list-type=2`: S3-style ListObjectsV2 (`prefix`, `delimiter`, `max-keys`, `continuation-token`)
 - `PUT /s3/{bucket}/{key}`: upload object
-- `GET /s3/{bucket}/{key}`: download object (supports `304`(Not Modified”), `Range` => `206/416`(Partial Content/Request Range Not Satisfiable))
-- `HEAD /s3/{bucket}/{key}`: metadata only (supports `304`(Not Modified”))
+- `GET /s3/{bucket}/{key}`: download object (supports `304`, `Range` => `206/416`)
+- `HEAD /s3/{bucket}/{key}`: metadata only (supports `304`, `Range` => `206/416`)
 - `DELETE /s3/{bucket}/{key}`: delete object
+
+## Conditional PUT and Integrity
+
+`PUT /s3/{bucket}/{key}` supports:
+
+- `If-None-Match`: prevent overwrite when ETag matches (`*` supported)
+- `If-Match`: only overwrite when ETag matches
+- `Content-MD5`: server validates payload checksum and returns `400 BadDigest` on mismatch
+
+Status codes:
+
+- `201`: new object created
+- `200`: existing object overwritten
+- `412`: precondition failed
+
+```bash
+# only create if key does not exist
+curl -i -X PUT -H "If-None-Match: *" --data-binary @file.bin \
+  http://127.0.0.1:8000/s3/demo/file.bin
+
+# only overwrite when ETag matches
+curl -i -X PUT -H 'If-Match: "d41d8cd98f00b204e9800998ecf8427e"' --data-binary @file.bin \
+  http://127.0.0.1:8000/s3/demo/file.bin
+
+# with Content-MD5
+MD5_B64=$(openssl md5 -binary file.bin | openssl base64)
+curl -i -X PUT -H "Content-MD5: ${MD5_B64}" --data-binary @file.bin \
+  http://127.0.0.1:8000/s3/demo/file.bin
+```
+
+## ListObjectsV2 Example
+
+```bash
+curl -sS "http://127.0.0.1:8000/s3/demo?list-type=2&prefix=logs/&delimiter=/&max-keys=100"
+
+python -m alocals3.client --endpoint http://127.0.0.1:8000 \
+  LIST_OBJECTS_V2 demo --prefix logs/ --delimiter / --max-keys 100
+```
 
 ## Partial Content Examples
 
@@ -59,7 +98,7 @@ curl -i -H "Range: bytes=-512" http://127.0.0.1:8000/s3/demo/video.bin
 
 # client CLI
 python -m alocals3.client --endpoint http://127.0.0.1:8000 \
-  get demo video.bin ./part.bin --range "bytes=0-99"
+  GET demo video.bin ./part.bin --range "bytes=0-99"
 ```
 
 ```python
@@ -85,6 +124,23 @@ client.close()
 - `PUT`: atomic blob replacement via temp file + `os.replace`; metadata mapping committed in DB transaction.
 - `DELETE`: metadata mapping deletion is transactional in DB (physical blob deletion is intentionally out of request path to minimize critical section and avoid races).
 - This is not a single global transaction across DB + filesystem. Under extreme failures, orphan blobs may exist and can be reclaimed by offline GC.
+
+## Offline GC
+
+```bash
+# scan only
+python -m alocals3.gc
+
+# delete orphan blobs
+python -m alocals3.gc --apply
+
+# after installation
+alocals3-gc --apply
+```
+
+## Updates
+
+[updates.md](updates.md)
 
 ## License
 

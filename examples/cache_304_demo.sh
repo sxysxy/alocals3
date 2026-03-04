@@ -14,8 +14,8 @@ SRC_FILE="$WORK_DIR/cache-item.txt"
 
 echo "cache demo $(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$SRC_FILE"
 
-python -m alocals3.client --endpoint "$ENDPOINT" mb "$BUCKET" >/dev/null 2>&1 || true
-python -m alocals3.client --endpoint "$ENDPOINT" put "$BUCKET" "$KEY" "$SRC_FILE" --content-type text/plain >/dev/null
+python -m alocals3.client --endpoint "$ENDPOINT" CREATE_BUCKET "$BUCKET" >/dev/null 2>&1 || true
+python -m alocals3.client --endpoint "$ENDPOINT" PUT "$BUCKET" "$KEY" "$SRC_FILE" --content-type text/plain >/dev/null
 
 HEADERS_FILE="$WORK_DIR/headers.txt"
 curl -sS -D "$HEADERS_FILE" -o /dev/null "$ENDPOINT/s3/$BUCKET/$KEY"
@@ -43,5 +43,5 @@ STATUS2="$(curl -sS -o /dev/null -w '%{http_code}' -H "If-Modified-Since: $LAST_
 echo "status=$STATUS2"
 
 # Comment the following two lines to keep the test data
-python -m alocals3.client --endpoint "$ENDPOINT" rm "$BUCKET" "$KEY" >/dev/null
-python -m alocals3.client --endpoint "$ENDPOINT" rb "$BUCKET" >/dev/null
+python -m alocals3.client --endpoint "$ENDPOINT" DELETE "$BUCKET" "$KEY" >/dev/null
+python -m alocals3.client --endpoint "$ENDPOINT" DELETE_BUCKET "$BUCKET" >/dev/null

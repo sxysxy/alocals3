@@ -11,6 +11,8 @@ pip install -r requirements.txt
 python -m alocals3.server --reload
 # 或者通过命令行覆盖数据库连接串
 python -m alocals3.server --database-url "sqlite:////absolute/path/alocals3.db" --reload
+# 设置应用日志级别
+python -m alocals3.server --log-level WARNING
 ```
 
 ## 配置
@@ -18,6 +20,7 @@ python -m alocals3.server --database-url "sqlite:////absolute/path/alocals3.db" 
 - `ALOCALS3_APP_NAME`: 应用名，默认 `alocals3`
 - `ALOCALS3_STORAGE_ROOT`: 本地对象数据目录，默认 `./data`
 - `ALOCALS3_DATABASE_URL`: 数据库连接串，默认 `sqlite:///./alocals3.db`
+- `ALOCALS3_LOG_LEVEL`: 日志级别，默认 `INFO`（可选 `DEBUG/INFO/WARNING/ERROR/CRITICAL`）
 
 示例：
 
@@ -25,6 +28,8 @@ python -m alocals3.server --database-url "sqlite:////absolute/path/alocals3.db" 
 - PostgreSQL: `postgresql+psycopg://user:password@127.0.0.1:5432/alocals3`
 
 说明：SQLite 连接串建议使用绝对路径，避免因启动目录不同导致读写到不同数据库文件。
+并发写场景下，SQLite 默认已开启 `WAL` + `busy_timeout`，并对 `database is locked` 做短重试。
+生产环境建议优先使用 PostgreSQL。
 
 ## 存储策略
 

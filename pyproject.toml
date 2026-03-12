@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alocals3"
-version = "0.2.0"
+version = "0.3.0"
 description = "alocals3: A local-storage based S3-like service(including server and client), powered by FastAPI"
 readme = "README.md"
 requires-python = ">=3.9"

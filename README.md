@@ -13,6 +13,8 @@ pip install -r requirements.txt
 python -m alocals3.server --reload
 # override DB URL from CLI
 python -m alocals3.server --database-url "sqlite:////absolute/path/alocals3.db" --reload
+# set application log level
+python -m alocals3.server --log-level WARNING
 ```
 
 ## Configuration
@@ -20,6 +22,7 @@ python -m alocals3.server --database-url "sqlite:////absolute/path/alocals3.db" 
 - `ALOCALS3_APP_NAME`: app name, default `alocals3`
 - `ALOCALS3_STORAGE_ROOT`: object storage root, default `./data`
 - `ALOCALS3_DATABASE_URL`: database URL, default `sqlite:///./alocals3.db`
+- `ALOCALS3_LOG_LEVEL`: log level, default `INFO` (`DEBUG/INFO/WARNING/ERROR/CRITICAL`)
 
 Examples:
 
@@ -27,6 +30,8 @@ Examples:
 - PostgreSQL: `postgresql+psycopg://user:password@127.0.0.1:5432/alocals3`
 
 Note: for SQLite, prefer an absolute path to avoid writing to different DB files due to different working directories.
+For concurrent writes, SQLite is configured with `WAL` + `busy_timeout`, and write transactions apply short retry on `database is locked`.
+For production workloads, PostgreSQL is strongly recommended.
 
 ## Storage Strategy
 

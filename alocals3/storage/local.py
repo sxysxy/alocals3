@@ -3,13 +3,15 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import os
+import random
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from alocals3.db import BucketModel, ObjectModel
@@ -17,6 +19,9 @@ from alocals3.schemas.storage import BucketInfo, ObjectInfo, StoredObject
 
 
 class LocalStorageBackend:
+    SQLITE_LOCK_RETRIES = 6
+    SQLITE_LOCK_BACKOFF_BASE_SEC = 0.02
+
     def __init__(self, root: Path, session_factory: sessionmaker) -> None:
         self.root = root.resolve()
         self.objects_root = self.root / "objects"
@@ -39,7 +44,7 @@ class LocalStorageBackend:
 
             row = BucketModel(name=bucket, created_at=now)
             session.add(row)
-            session.commit()
+            self._commit_with_retry(session, "create_bucket")
             return BucketInfo(name=row.name, created_at=_to_utc(row.created_at))
 
     def delete_bucket(self, bucket: str) -> None:
@@ -54,7 +59,7 @@ class LocalStorageBackend:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Bucket is not empty")
 
             session.delete(bucket_row)
-            session.commit()
+            self._commit_with_retry(session, "delete_bucket")
 
     def list_objects(self, bucket: str, prefix: str | None = None, limit: int = 1000) -> list[ObjectInfo]:
         self._validate_bucket(bucket)
@@ -191,7 +196,7 @@ class LocalStorageBackend:
                         row.etag = etag
                         row.updated_at = now
 
-                    session.commit()
+                    self._commit_with_retry(session, "put_object")
                     break
                 except IntegrityError:
                     session.rollback()
@@ -247,7 +252,7 @@ class LocalStorageBackend:
 
             # Atomic delete on metadata mapping (critical section kept in DB transaction).
             session.delete(row)
-            session.commit()
+            self._commit_with_retry(session, "delete_object")
 
     def get_object_info(self, bucket: str, key: str) -> ObjectInfo | None:
         self._validate_bucket(bucket)
@@ -313,8 +318,31 @@ class LocalStorageBackend:
             if tmp_path.exists():
                 tmp_path.unlink(missing_ok=True)
 
+    def _commit_with_retry(self, session: Session, operation: str) -> None:
+        for attempt in range(self.SQLITE_LOCK_RETRIES):
+            try:
+                session.commit()
+                return
+            except OperationalError as exc:
+                if not _is_locked_error(exc):
+                    raise
+                session.rollback()
+                if attempt == self.SQLITE_LOCK_RETRIES - 1:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=f"Database busy while {operation}, please retry",
+                    ) from exc
+                # Jitter avoids herd retries under contention.
+                sleep_s = self.SQLITE_LOCK_BACKOFF_BASE_SEC * (2**attempt)
+                time.sleep(sleep_s * (0.8 + random.random() * 0.4))
+
 
 def _to_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _is_locked_error(exc: OperationalError) -> bool:
+    text = str(exc).lower()
+    return "database is locked" in text or "database table is locked" in text

@@ -12,6 +12,7 @@ class Settings:
     api_prefix: str = "/s3"
     storage_root: Path = Path("./data")
     database_url: str = "sqlite:///./alocals3.db"
+    log_level: str = "INFO"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -19,11 +20,13 @@ class Settings:
         api_prefix = os.getenv("ALOCALS3_API_PREFIX", "/s3")
         storage_root = Path(os.getenv("ALOCALS3_STORAGE_ROOT", "./data"))
         database_url = os.getenv("ALOCALS3_DATABASE_URL", "sqlite:///./alocals3.db")
+        log_level = os.getenv("ALOCALS3_LOG_LEVEL", "INFO")
         return cls(
             app_name=app_name,
             api_prefix=api_prefix,
             storage_root=storage_root,
             database_url=database_url,
+            log_level=log_level,
         )
 
 

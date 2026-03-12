@@ -17,6 +17,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1", help="Bind host")
     parser.add_argument("--port", type=int, default=8000, help="Bind port")
     parser.add_argument("--reload", action="store_true", help="Enable auto reload")
+    parser.add_argument("--log-level", default=None, help="Application log level: DEBUG/INFO/WARNING/ERROR/CRITICAL")
     parser.add_argument("--database-url", default=None, help="SQLAlchemy database URL")
     parser.add_argument("--storage-root", default=None, help="Object storage root directory")
     parser.add_argument("--app-name", default=None, help="Application name")
@@ -33,6 +34,8 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["ALOCALS3_STORAGE_ROOT"] = args.storage_root
     if args.app_name:
         os.environ["ALOCALS3_APP_NAME"] = args.app_name
+    if args.log_level:
+        os.environ["ALOCALS3_LOG_LEVEL"] = args.log_level.upper()
 
     get_settings.cache_clear()
     get_storage.cache_clear()

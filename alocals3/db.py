@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, create_engine
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
@@ -52,8 +52,22 @@ class ObjectModel(Base):
 def create_db_engine(database_url: str) -> Engine:
     kwargs: dict = {"pool_pre_ping": True}
     if database_url.startswith("sqlite"):
-        kwargs["connect_args"] = {"check_same_thread": False}
-    return create_engine(database_url, **kwargs)
+        kwargs["connect_args"] = {
+            "check_same_thread": False,
+            "timeout": 10.0,
+        }
+    engine = create_engine(database_url, **kwargs)
+
+    if database_url.startswith("sqlite"):
+        @event.listens_for(engine, "connect")
+        def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:  # type: ignore[no-untyped-def]
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA busy_timeout=10000;")
+            cursor.execute("PRAGMA synchronous=NORMAL;")
+            cursor.close()
+
+    return engine
 
 
 def create_session_factory(engine: Engine) -> sessionmaker:

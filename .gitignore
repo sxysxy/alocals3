@@ -4,6 +4,8 @@ build
 dist
 *.egg-info
 alocals3.db
+alocals3.db-shm
+alocals3.db-wal
 data
 examples/.tmp
 .DS_Store

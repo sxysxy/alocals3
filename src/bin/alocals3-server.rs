@@ -746,40 +746,50 @@ impl Storage {
     ) -> ApiResult<bool> {
         match self {
             Self::Sqlite { pool, .. } => {
-                let existing =
-                    sqlx::query("SELECT id FROM objects WHERE bucket_id = ?1 AND key = ?2")
-                        .bind(bucket_id)
-                        .bind(key)
-                        .fetch_optional(pool)
-                        .await?;
-                if let Some(row) = existing {
-                    let id: i64 = row.get(0);
-                    sqlx::query("UPDATE objects SET file_path = ?1, size = ?2, content_type = ?3, etag = ?4, updated_at = ?5 WHERE id = ?6")
-                        .bind(file_path).bind(size).bind(content_type).bind(etag).bind(updated_at).bind(id).execute(pool).await?;
-                    Ok(false)
-                } else {
-                    sqlx::query("INSERT INTO objects (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)")
-                        .bind(bucket_id).bind(key).bind(file_path).bind(size).bind(content_type).bind(etag).bind(updated_at).execute(pool).await?;
-                    Ok(true)
-                }
+                let result = sqlx::query(
+                    "INSERT INTO objects (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                     ON CONFLICT(bucket_id, key) DO UPDATE SET
+                        file_path = excluded.file_path,
+                        size = excluded.size,
+                        content_type = excluded.content_type,
+                        etag = excluded.etag,
+                        updated_at = excluded.updated_at
+                     RETURNING created_at = updated_at",
+                )
+                .bind(bucket_id)
+                .bind(key)
+                .bind(file_path)
+                .bind(size)
+                .bind(content_type)
+                .bind(etag)
+                .bind(updated_at)
+                .fetch_one(pool)
+                .await?;
+                Ok(result.get(0))
             }
             Self::Postgres { pool, .. } => {
-                let existing =
-                    sqlx::query("SELECT id FROM objects WHERE bucket_id = $1 AND key = $2")
-                        .bind(bucket_id)
-                        .bind(key)
-                        .fetch_optional(pool)
-                        .await?;
-                if let Some(row) = existing {
-                    let id: i64 = row.get(0);
-                    sqlx::query("UPDATE objects SET file_path = $1, size = $2, content_type = $3, etag = $4, updated_at = $5 WHERE id = $6")
-                        .bind(file_path).bind(size).bind(content_type).bind(etag).bind(updated_at).bind(id).execute(pool).await?;
-                    Ok(false)
-                } else {
-                    sqlx::query("INSERT INTO objects (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $7)")
-                        .bind(bucket_id).bind(key).bind(file_path).bind(size).bind(content_type).bind(etag).bind(updated_at).execute(pool).await?;
-                    Ok(true)
-                }
+                let row = sqlx::query(
+                    "INSERT INTO objects (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+                     ON CONFLICT(bucket_id, key) DO UPDATE SET
+                        file_path = EXCLUDED.file_path,
+                        size = EXCLUDED.size,
+                        content_type = EXCLUDED.content_type,
+                        etag = EXCLUDED.etag,
+                        updated_at = EXCLUDED.updated_at
+                     RETURNING xmax = 0",
+                )
+                .bind(bucket_id)
+                .bind(key)
+                .bind(file_path)
+                .bind(size)
+                .bind(content_type)
+                .bind(etag)
+                .bind(updated_at)
+                .fetch_one(pool)
+                .await?;
+                Ok(row.get(0))
             }
         }
     }

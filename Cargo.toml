@@ -4,40 +4,55 @@ version = "0.4.0"
 edition = "2021"
 
 [lib]
-name = "_rust"
+name = "_alocals3_native"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "alocals3-server"
 path = "src/bin/alocals3-server.rs"
+required-features = ["server"]
 
 [dependencies]
-axum = "0.7"
-anyhow = "1"
-base64 = "0.22"
-bytes = "1"
+anyhow = { version = "1", optional = true }
+axum = { version = "0.7", optional = true }
+base64 = { version = "0.22", optional = true }
+bytes = { version = "1", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-clap = { version = "4", features = ["derive", "env"] }
-http = "1"
+clap = { version = "4", features = ["derive", "env"], optional = true }
+http = { version = "1", optional = true }
 md5 = "0.7"
 mime_guess = "2"
 percent-encoding = "2"
-pyo3 = { version = "0.21", features = ["abi3-py39"] }
+pyo3 = { version = "0.21", features = ["abi3-py312"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "net", "signal"] }
-tower-http = { version = "0.6", features = ["trace"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres"], optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "net", "signal"], optional = true }
+tower-http = { version = "0.6", features = ["trace"], optional = true }
 uuid = { version = "1", features = ["v4"] }
 
 [package.metadata.maturin]
-module-name = "alocals3._rust"
+module-name = "alocals3._alocals3_native"
 python-source = "."
 features = ["extension-module"]
 
 [features]
 default = []
 extension-module = ["pyo3/extension-module"]
+server = [
+    "dep:anyhow",
+    "dep:axum",
+    "dep:base64",
+    "dep:bytes",
+    "dep:clap",
+    "dep:http",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:sqlx",
+    "dep:tokio",
+    "dep:tower-http",
+]
+server-binary = []

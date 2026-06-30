@@ -2,15 +2,25 @@
 
 # alocals3
 
-A local-storage-based S3-like service with a pure Rust server and a Rust-backed Python client.
+`alocals3` is a local S3-like object store focused on fast local development and internal workloads.
+
+The current `main` branch is Rust-first:
+
+- Server: pure Rust binary, no Python runtime required.
+- Metadata backend: SQLite or PostgreSQL.
+- Object payloads: local filesystem with SHA-256 based sharding.
+- Python client: wheel package backed by Rust networking through `reqwest`.
+- Python target: Python 3.12+ with PyO3 `abi3-py312` limited API.
+
+The project implements an S3-compatible subset, not the full AWS S3 API surface.
 
 ## Quick Start
 
+Build and run the Rust server:
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
-cargo build --release --bin alocals3-server
+PYO3_NO_PYTHON=1 cargo build --release --no-default-features --features server,server-binary --bin alocals3-server
+
 target/release/alocals3-server \
   --host 127.0.0.1 \
   --port 8000 \
@@ -18,156 +28,189 @@ target/release/alocals3-server \
   --storage-root ./data
 ```
 
-## Rust Server And Python Client
-
-The server is the `alocals3-server` Rust binary and does not use Python. It supports both SQLite and PostgreSQL metadata backends while storing object payloads on local disk.
+Use PostgreSQL instead of SQLite:
 
 ```bash
-# SQLite
-target/release/alocals3-server --database-url "sqlite:///./alocals3.db"
-
-# PostgreSQL
 target/release/alocals3-server \
-  --database-url "postgresql://user:password@127.0.0.1:5432/alocals3"
+  --host 127.0.0.1 \
+  --port 8000 \
+  --database-url "postgresql://user:password@127.0.0.1:5432/alocals3" \
+  --storage-root ./data
 ```
 
-The Python package is a wheel built with `maturin`. It exposes `LocalS3Client` and `LocalS3ClientAsync`, but the HTTP networking is implemented in Rust through `reqwest`, not `httpx`.
+Install the Python client from source:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip maturin
+python -m pip install -e .
+```
+
+## Build Artifacts
+
+Release helper scripts live in [scripts](scripts/README.md):
+
+```bash
+# Linux static server plus Python 3.12+ ABI3 wheel
+scripts/build-linux-release.sh
+
+# macOS arm64, macOS 11 deployment baseline
+scripts/build-macos-release.sh
+
+# Windows 10+ PowerShell
+.\scripts\build-windows-release.ps1
+```
+
+Linux server builds default to `x86_64-unknown-linux-musl`. macOS builds default to `aarch64-apple-darwin` with `MACOSX_DEPLOYMENT_TARGET=11.0`.
+
+The wheel is configured as Python 3.12+ ABI3 via PyO3 `abi3-py312`. It is not a `cp312-cp312` wheel unless the ABI3 feature is removed.
 
 ## Configuration
 
-- `ALOCALS3_STORAGE_ROOT`: object storage root, default `./data`
-- `ALOCALS3_DATABASE_URL`: database URL, default `sqlite:///./alocals3.db`
+Server CLI flags:
 
-Examples:
+- `--host`: bind host, default `127.0.0.1`
+- `--port`: bind port, default `8000`
+- `--database-url`: SQLite or PostgreSQL URL
+- `--storage-root`: object payload root directory
+
+Environment variables:
+
+- `ALOCALS3_DATABASE_URL`: default `sqlite:///./alocals3.db`
+- `ALOCALS3_STORAGE_ROOT`: default `./data`
+
+Database URL examples:
 
 - SQLite: `sqlite:///./alocals3.db`
 - PostgreSQL: `postgresql://user:password@127.0.0.1:5432/alocals3`
 
-Note: for SQLite, prefer an absolute path to avoid writing to different DB files due to different working directories.
-For concurrent writes, SQLite is configured with `WAL` + `busy_timeout`.
-For production workloads, PostgreSQL is strongly recommended.
+Use an absolute SQLite path in scripts and services to avoid accidentally writing to different database files from different working directories. PostgreSQL is recommended for sustained concurrent workloads.
 
-## Storage Strategy
+## Storage Layout
 
-- Key/object metadata is indexed in SQLite or PostgreSQL by the Rust server
-- Object payload is stored on local disk
-- Blob file path uses hash sharding:
+- Bucket and object metadata is stored in SQLite or PostgreSQL.
+- Object bytes are stored on local disk.
+- Blob paths are content-addressed and sharded:
   - `sha256(<object bytes>) = <digest>`
   - `{storage_root}/objects/{digest[:2]}/{digest[2:4]}/{digest}`
 
-## API Overview
+Object keys, bucket names, prefixes, delimiters, and continuation tokens are UTF-8 text. Client path parameters are UTF-8 percent-encoded automatically; pass raw strings such as `logs/data.txt` or `logs/数据.txt`, not pre-encoded URL fragments.
+
+## HTTP API
 
 - `GET /healthz`: health check
 - `GET /s3`: list buckets
 - `PUT /s3/{bucket}`: create bucket
 - `DELETE /s3/{bucket}`: delete empty bucket
 - `GET /s3/{bucket}/objects`: list objects
-- `GET /s3/{bucket}?list-type=2`: S3-style ListObjectsV2 (`prefix`, `delimiter`, `max-keys`, `continuation-token`)
+- `GET /s3/{bucket}?list-type=2`: S3-style ListObjectsV2
 - `PUT /s3/{bucket}/{key}`: upload object
-- `GET /s3/{bucket}/{key}`: download object (supports `304`, `Range` => `206/416`)
-- `HEAD /s3/{bucket}/{key}`: metadata only (supports `304`, `Range` => `206/416`)
+- `GET /s3/{bucket}/{key}`: download object
+- `HEAD /s3/{bucket}/{key}`: object metadata
 - `DELETE /s3/{bucket}/{key}`: delete object
 
-Bucket names, object keys, prefixes, delimiters, and continuation tokens are treated as UTF-8 text. Client path parameters are UTF-8 percent-encoded automatically; pass raw strings such as `logs/数据.txt`, not pre-encoded URL fragments.
+Supported object features:
 
-## Conditional PUT and Integrity
+- `ETag` is the MD5 hex digest of the object body.
+- `Range` requests return `206` or `416`.
+- `If-None-Match` and `If-Match` are supported for `PUT`.
+- `Content-MD5` is validated on `PUT`.
+- `If-None-Match` is supported for `GET` and `HEAD`.
 
-`PUT /s3/{bucket}/{key}` supports:
-
-- `If-None-Match`: prevent overwrite when ETag matches (`*` supported)
-- `If-Match`: only overwrite when ETag matches
-- `Content-MD5`: server validates payload checksum and returns `400 BadDigest` on mismatch
-
-Status codes:
+`PUT /s3/{bucket}/{key}` returns:
 
 - `201`: new object created
 - `200`: existing object overwritten
-- `412`: precondition failed
+- `400`: invalid `Content-MD5`
+- `412`: conditional request failed
+
+## Client Usage
+
+The Python runtime dependency list is intentionally empty. HTTP networking is implemented in Rust, not `httpx`.
+
+```python
+import asyncio
+from pathlib import Path
+
+from alocals3.client import LocalS3Client, LocalS3ClientAsync
+
+with LocalS3Client("http://127.0.0.1:8000", disable_proxy=True) as client:
+    client.create_bucket("demo")
+    info = client.put_object("demo", "logs/数据.txt", Path("data.txt"))
+    print(info["etag"])
+
+    data, headers = client.get_object_range("demo", "logs/数据.txt", "bytes=0-99")
+    print(len(data), headers.get("content-range"))
+
+    client.get_object_to_file("demo", "logs/数据.txt", Path("copy.txt"))
+
+
+async def main() -> None:
+    async with LocalS3ClientAsync("http://127.0.0.1:8000", disable_proxy=True) as client:
+        print(await client.list_buckets())
+
+
+asyncio.run(main())
+```
+
+CLI:
 
 ```bash
-# only create if key does not exist
+python -m alocals3.client --endpoint http://127.0.0.1:8000 CREATE_BUCKET demo
+python -m alocals3.client --endpoint http://127.0.0.1:8000 PUT demo file.bin ./file.bin
+python -m alocals3.client --endpoint http://127.0.0.1:8000 GET demo file.bin ./copy.bin
+python -m alocals3.client --endpoint http://127.0.0.1:8000 LIST_OBJECTS_V2 demo --prefix logs/ --delimiter /
+```
+
+Set `disable_proxy=True` or pass `--disable-proxy` to ignore proxy environment variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`.
+
+## Curl Examples
+
+```bash
+curl -i -X PUT http://127.0.0.1:8000/s3/demo
+curl -i -X PUT --data-binary @file.bin http://127.0.0.1:8000/s3/demo/file.bin
+curl -i http://127.0.0.1:8000/s3/demo/file.bin
+curl -i -H "Range: bytes=0-99" http://127.0.0.1:8000/s3/demo/file.bin
+curl -sS "http://127.0.0.1:8000/s3/demo?list-type=2&prefix=logs/&delimiter=/&max-keys=100"
+```
+
+Conditional PUT:
+
+```bash
 curl -i -X PUT -H "If-None-Match: *" --data-binary @file.bin \
   http://127.0.0.1:8000/s3/demo/file.bin
 
-# only overwrite when ETag matches
 curl -i -X PUT -H 'If-Match: "d41d8cd98f00b204e9800998ecf8427e"' --data-binary @file.bin \
   http://127.0.0.1:8000/s3/demo/file.bin
 
-# with Content-MD5
 MD5_B64=$(openssl md5 -binary file.bin | openssl base64)
 curl -i -X PUT -H "Content-MD5: ${MD5_B64}" --data-binary @file.bin \
   http://127.0.0.1:8000/s3/demo/file.bin
 ```
 
-## ListObjectsV2 Example
+## Consistency Notes
+
+- Object bytes are written through a temporary file and atomic rename.
+- Metadata updates are committed through the selected database backend.
+- This is not a single distributed transaction across database and filesystem.
+- Under process or machine failure, orphan blob files may exist and can be removed by offline GC.
+
+## Legacy Python Code
+
+The repository still contains the previous Python server/storage modules for compatibility and migration work. The Rust server is the intended runtime on `main`.
+
+Legacy Python paths may require optional dependencies:
 
 ```bash
-curl -sS "http://127.0.0.1:8000/s3/demo?list-type=2&prefix=logs/&delimiter=/&max-keys=100"
-
-python -m alocals3.client --endpoint http://127.0.0.1:8000 \
-  LIST_OBJECTS_V2 demo --prefix logs/ --delimiter / --max-keys 100
+python -m pip install ".[legacy-python-server]"
 ```
 
-## Partial Content Examples
+Offline GC is currently a Python utility:
 
 ```bash
-# first 100 bytes
-curl -i -H "Range: bytes=0-99" http://127.0.0.1:8000/s3/demo/video.bin
-
-# last 512 bytes
-curl -i -H "Range: bytes=-512" http://127.0.0.1:8000/s3/demo/video.bin
-
-# client CLI
-python -m alocals3.client --endpoint http://127.0.0.1:8000 \
-  GET demo video.bin ./part.bin --range "bytes=0-99"
-```
-
-```python
-import asyncio
-from pathlib import Path
-from alocals3.client import LocalS3Client, LocalS3ClientAsync
-
-client = LocalS3Client("http://127.0.0.1:8000")
-data, headers = client.get_object_range("demo", "video.bin", "bytes=0-99")
-print(len(data), headers.get("content-range"))
-
-headers = client.get_object_to_file(
-    "demo",
-    "video.bin",
-    Path("./part.bin"),
-    range_header="bytes=100-199",
-)
-print(headers.get("content-range"))
-client.close()
-
-# Ignore HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY from the environment.
-client = LocalS3Client("http://127.0.0.1:8000", disable_proxy=True)
-client.close()
-
-async def main():
-    async with LocalS3ClientAsync("http://127.0.0.1:8000", disable_proxy=True) as async_client:
-        print(await async_client.list_buckets())
-
-asyncio.run(main())
-```
-
-## Consistency and Atomicity
-
-- `PUT`: atomic blob replacement via temp file + `os.replace`; metadata mapping committed in DB transaction.
-- `DELETE`: metadata mapping deletion is transactional in DB (physical blob deletion is intentionally out of request path to minimize critical section and avoid races).
-- This is not a single global transaction across DB + filesystem. Under extreme failures, orphan blobs may exist and can be reclaimed by offline GC.
-
-## Offline GC
-
-```bash
-# scan only
 python -m alocals3.gc
-
-# delete orphan blobs
 python -m alocals3.gc --apply
-
-# after installation
-alocals3-gc --apply
 ```
 
 ## Updates

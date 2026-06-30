@@ -9,7 +9,7 @@ from fastapi import HTTPException, status
 from alocals3.schemas.storage import BucketInfo, ObjectInfo, StoredObject
 
 try:
-    from alocals3._rust import RustStorageBackend as _RustStorageBackend
+    from alocals3._alocals3_native import RustStorageBackend as _RustStorageBackend
 except ModuleNotFoundError:  # pragma: no cover - depends on extension build
     _RustStorageBackend = None  # type: ignore[assignment]
 
@@ -20,7 +20,7 @@ _ERR_PREFIX = "ALOCALS3_STORAGE_ERROR:"
 class RustLocalStorageBackend:
     def __init__(self, root: Path, database_url: str) -> None:
         if _RustStorageBackend is None:
-            raise RuntimeError("alocals3._rust is not installed")
+            raise RuntimeError("alocals3._alocals3_native is not installed")
         self._backend = _RustStorageBackend(str(root), database_url)
 
     def list_buckets(self) -> list[BucketInfo]:

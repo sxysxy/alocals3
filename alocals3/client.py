@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from alocals3._rust import RustHttpClient
+    from alocals3._alocals3_native import RustHttpClient
 except ModuleNotFoundError:  # pragma: no cover - depends on extension build
     RustHttpClient = None  # type: ignore[assignment]
 
@@ -21,7 +21,7 @@ class LocalS3Client:
         disable_proxy: bool = False,
     ) -> None:
         if RustHttpClient is None:
-            raise RuntimeError("alocals3._rust is required; install with: pip install -e .")
+            raise RuntimeError("alocals3._alocals3_native is required; install with: pip install -e .")
         self._client = RustHttpClient(base_url, timeout, disable_proxy)
 
     def __enter__(self) -> "LocalS3Client":

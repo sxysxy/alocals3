@@ -7,7 +7,7 @@ name = "alocals3"
 version = "0.4.0"
 description = "alocals3: a Rust S3-like server and Rust-backed Python client"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 license = "MIT"
 authors = [
   { name = "alocals3 contributors" }
@@ -17,9 +17,6 @@ classifiers = [
   "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
 ]
 dependencies = []
@@ -41,7 +38,17 @@ Repository = "https://github.com/sxysxy/alocals3"
 alocals3-client = "alocals3.client:main"
 
 [tool.maturin]
-module-name = "alocals3._rust"
+module-name = "alocals3._alocals3_native"
 python-source = "."
 features = ["extension-module"]
 include = ["alocals3/**/*", "README.md", "README.zh-CN.md", "LICENSE"]
+exclude = [
+  "alocals3/_alocals3_native*.so",
+  "alocals3/_alocals3_native*.pyd",
+  "alocals3/_alocals3_native*.dll",
+  "alocals3/_rust*.so",
+  "alocals3/_rust*.pyd",
+  "alocals3/_rust*.dll",
+  "alocals3/**/__pycache__/*",
+  "alocals3/**/*.pyc",
+]

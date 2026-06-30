@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "alocals3"
-version = "0.5.0"
+version = "0.6.0"
 description = "alocals3: a Rust S3-like server and Rust-backed Python client"
 readme = "README.md"
 requires-python = ">=3.12"

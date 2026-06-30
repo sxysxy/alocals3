@@ -5,12 +5,12 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from urllib.parse import quote
+from typing import Any
 
 try:
-    import httpx
-except ModuleNotFoundError:  # pragma: no cover - runtime environment dependent
-    httpx = None  # type: ignore[assignment]
+    from alocals3._rust import RustHttpClient
+except ModuleNotFoundError:  # pragma: no cover - depends on extension build
+    RustHttpClient = None  # type: ignore[assignment]
 
 
 class LocalS3Client:
@@ -20,10 +20,9 @@ class LocalS3Client:
         timeout: float = 10.0,
         disable_proxy: bool = False,
     ) -> None:
-        if httpx is None:
-            raise RuntimeError("httpx is required, run: pip install -r requirements.txt")
-        self.base_url = _ensure_utf8_text(base_url, "base_url").rstrip("/")
-        self._client = httpx.Client(base_url=self.base_url, timeout=timeout, trust_env=not disable_proxy)
+        if RustHttpClient is None:
+            raise RuntimeError("alocals3._rust is required; install with: pip install -e .")
+        self._client = RustHttpClient(base_url, timeout, disable_proxy)
 
     def __enter__(self) -> "LocalS3Client":
         return self
@@ -32,31 +31,19 @@ class LocalS3Client:
         self.close()
 
     def health(self) -> dict:
-        response = self._client.get("/healthz")
-        response.raise_for_status()
-        return response.json()
+        return _loads(self._client.health_json())
 
     def list_buckets(self) -> list[dict]:
-        response = self._client.get("/s3")
-        response.raise_for_status()
-        return response.json()
+        return _loads(self._client.list_buckets_json())
 
     def create_bucket(self, bucket: str) -> dict:
-        response = self._client.put(_bucket_path(bucket))
-        response.raise_for_status()
-        return response.json()
+        return _loads(self._client.create_bucket_json(bucket))
 
     def delete_bucket(self, bucket: str) -> None:
-        response = self._client.delete(_bucket_path(bucket))
-        response.raise_for_status()
+        self._client.delete_bucket(bucket)
 
     def list_objects(self, bucket: str, prefix: str | None = None, limit: int = 1000) -> list[dict]:
-        params = {"limit": limit}
-        if prefix:
-            params["prefix"] = _ensure_utf8_text(prefix, "prefix")
-        response = self._client.get(f"{_bucket_path(bucket)}/objects", params=params)
-        response.raise_for_status()
-        return response.json()
+        return _loads(self._client.list_objects_json(bucket, prefix, limit))
 
     def list_objects_v2(
         self,
@@ -66,41 +53,17 @@ class LocalS3Client:
         max_keys: int = 1000,
         continuation_token: str | None = None,
     ) -> dict:
-        params: dict[str, str | int] = {
-            "list-type": 2,
-            "prefix": _ensure_utf8_text(prefix, "prefix"),
-            "delimiter": _ensure_utf8_text(delimiter, "delimiter"),
-            "max-keys": max_keys,
-            "output": "json",
-        }
-        if continuation_token:
-            params["continuation-token"] = _ensure_utf8_text(continuation_token, "continuation_token")
-        response = self._client.get(_bucket_path(bucket), params=params)
-        response.raise_for_status()
-        return response.json()
+        return _loads(self._client.list_objects_v2_json(bucket, prefix, delimiter, max_keys, continuation_token))
 
     def put_object(self, bucket: str, key: str, file_path: Path, content_type: str | None = None) -> dict:
-        body = file_path.read_bytes()
-        headers: dict[str, str] = {}
-        if content_type:
-            headers["content-type"] = _ensure_utf8_text(content_type, "content_type")
-        response = self._client.put(_object_path(bucket, key), content=body, headers=headers)
-        response.raise_for_status()
-        return response.json()
+        return _loads(self._client.put_object_json(bucket, key, str(file_path), content_type))
 
     def get_object(self, bucket: str, key: str, output_path: Path) -> None:
-        response = self._client.get(_object_path(bucket, key))
-        response.raise_for_status()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(response.content)
+        self._client.get_object_to_file(bucket, key, str(output_path), None)
 
     def get_object_range(self, bucket: str, key: str, range_header: str) -> tuple[bytes, dict]:
-        response = self._client.get(
-            _object_path(bucket, key),
-            headers={"range": _ensure_utf8_text(range_header, "range_header")},
-        )
-        response.raise_for_status()
-        return response.content, dict(response.headers)
+        result = self._client.get_object_range(bucket, key, range_header)
+        return result["body"], result["headers"]
 
     def get_object_to_file(
         self,
@@ -109,21 +72,13 @@ class LocalS3Client:
         output_path: Path,
         range_header: str | None = None,
     ) -> dict:
-        headers: dict[str, str] = {}
-        if range_header:
-            headers["range"] = _ensure_utf8_text(range_header, "range_header")
-        response = self._client.get(_object_path(bucket, key), headers=headers)
-        response.raise_for_status()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(response.content)
-        return dict(response.headers)
+        return self._client.get_object_to_file(bucket, key, str(output_path), range_header)
 
     def delete_object(self, bucket: str, key: str) -> None:
-        response = self._client.delete(_object_path(bucket, key))
-        response.raise_for_status()
+        self._client.delete_object(bucket, key)
 
     def close(self) -> None:
-        self._client.close()
+        return None
 
 
 class LocalS3ClientAsync:
@@ -133,10 +88,7 @@ class LocalS3ClientAsync:
         timeout: float = 10.0,
         disable_proxy: bool = False,
     ) -> None:
-        if httpx is None:
-            raise RuntimeError("httpx is required, run: pip install -r requirements.txt")
-        self.base_url = _ensure_utf8_text(base_url, "base_url").rstrip("/")
-        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout, trust_env=not disable_proxy)
+        self._sync = LocalS3Client(base_url=base_url, timeout=timeout, disable_proxy=disable_proxy)
 
     async def __aenter__(self) -> "LocalS3ClientAsync":
         return self
@@ -145,31 +97,19 @@ class LocalS3ClientAsync:
         await self.close()
 
     async def health(self) -> dict:
-        response = await self._client.get("/healthz")
-        response.raise_for_status()
-        return response.json()
+        return await asyncio.to_thread(self._sync.health)
 
     async def list_buckets(self) -> list[dict]:
-        response = await self._client.get("/s3")
-        response.raise_for_status()
-        return response.json()
+        return await asyncio.to_thread(self._sync.list_buckets)
 
     async def create_bucket(self, bucket: str) -> dict:
-        response = await self._client.put(_bucket_path(bucket))
-        response.raise_for_status()
-        return response.json()
+        return await asyncio.to_thread(self._sync.create_bucket, bucket)
 
     async def delete_bucket(self, bucket: str) -> None:
-        response = await self._client.delete(_bucket_path(bucket))
-        response.raise_for_status()
+        await asyncio.to_thread(self._sync.delete_bucket, bucket)
 
     async def list_objects(self, bucket: str, prefix: str | None = None, limit: int = 1000) -> list[dict]:
-        params = {"limit": limit}
-        if prefix:
-            params["prefix"] = _ensure_utf8_text(prefix, "prefix")
-        response = await self._client.get(f"{_bucket_path(bucket)}/objects", params=params)
-        response.raise_for_status()
-        return response.json()
+        return await asyncio.to_thread(self._sync.list_objects, bucket, prefix, limit)
 
     async def list_objects_v2(
         self,
@@ -179,40 +119,23 @@ class LocalS3ClientAsync:
         max_keys: int = 1000,
         continuation_token: str | None = None,
     ) -> dict:
-        params: dict[str, str | int] = {
-            "list-type": 2,
-            "prefix": _ensure_utf8_text(prefix, "prefix"),
-            "delimiter": _ensure_utf8_text(delimiter, "delimiter"),
-            "max-keys": max_keys,
-            "output": "json",
-        }
-        if continuation_token:
-            params["continuation-token"] = _ensure_utf8_text(continuation_token, "continuation_token")
-        response = await self._client.get(_bucket_path(bucket), params=params)
-        response.raise_for_status()
-        return response.json()
+        return await asyncio.to_thread(
+            self._sync.list_objects_v2,
+            bucket,
+            prefix,
+            delimiter,
+            max_keys,
+            continuation_token,
+        )
 
     async def put_object(self, bucket: str, key: str, file_path: Path, content_type: str | None = None) -> dict:
-        body = await asyncio.to_thread(file_path.read_bytes)
-        headers: dict[str, str] = {}
-        if content_type:
-            headers["content-type"] = _ensure_utf8_text(content_type, "content_type")
-        response = await self._client.put(_object_path(bucket, key), content=body, headers=headers)
-        response.raise_for_status()
-        return response.json()
+        return await asyncio.to_thread(self._sync.put_object, bucket, key, file_path, content_type)
 
     async def get_object(self, bucket: str, key: str, output_path: Path) -> None:
-        response = await self._client.get(_object_path(bucket, key))
-        response.raise_for_status()
-        await asyncio.to_thread(_write_bytes, output_path, response.content)
+        await asyncio.to_thread(self._sync.get_object, bucket, key, output_path)
 
     async def get_object_range(self, bucket: str, key: str, range_header: str) -> tuple[bytes, dict]:
-        response = await self._client.get(
-            _object_path(bucket, key),
-            headers={"range": _ensure_utf8_text(range_header, "range_header")},
-        )
-        response.raise_for_status()
-        return response.content, dict(response.headers)
+        return await asyncio.to_thread(self._sync.get_object_range, bucket, key, range_header)
 
     async def get_object_to_file(
         self,
@@ -221,52 +144,20 @@ class LocalS3ClientAsync:
         output_path: Path,
         range_header: str | None = None,
     ) -> dict:
-        headers: dict[str, str] = {}
-        if range_header:
-            headers["range"] = _ensure_utf8_text(range_header, "range_header")
-        response = await self._client.get(_object_path(bucket, key), headers=headers)
-        response.raise_for_status()
-        await asyncio.to_thread(_write_bytes, output_path, response.content)
-        return dict(response.headers)
+        return await asyncio.to_thread(self._sync.get_object_to_file, bucket, key, output_path, range_header)
 
     async def delete_object(self, bucket: str, key: str) -> None:
-        response = await self._client.delete(_object_path(bucket, key))
-        response.raise_for_status()
+        await asyncio.to_thread(self._sync.delete_object, bucket, key)
 
     async def close(self) -> None:
-        await self._client.aclose()
+        self._sync.close()
 
     async def aclose(self) -> None:
         await self.close()
 
 
-def _write_bytes(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(content)
-
-
-def _bucket_path(bucket: str) -> str:
-    return f"/s3/{_quote_path_segment(bucket, 'bucket')}"
-
-
-def _object_path(bucket: str, key: str) -> str:
-    return f"{_bucket_path(bucket)}/{_quote_key_path(key)}"
-
-
-def _quote_path_segment(value: str, field_name: str) -> str:
-    return quote(_ensure_utf8_text(value, field_name), safe="", encoding="utf-8", errors="strict")
-
-
-def _quote_key_path(key: str) -> str:
-    return quote(_ensure_utf8_text(key, "key"), safe="/", encoding="utf-8", errors="strict")
-
-
-def _ensure_utf8_text(value: str, field_name: str) -> str:
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise ValueError(f"{field_name} must be valid UTF-8 text") from exc
-    return value
+def _loads(value: str) -> Any:
+    return json.loads(value)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -276,7 +167,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-proxy", action="store_true", help="Ignore proxy environment variables")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
-
     subparsers.add_parser("HEALTH", aliases=["health"], help="Check server health")
     subparsers.add_parser("LIST_BUCKETS", aliases=["lsb"], help="List buckets")
 
@@ -298,17 +188,17 @@ def _build_parser() -> argparse.ArgumentParser:
     lso2.add_argument("--max-keys", type=int, default=1000)
     lso2.add_argument("--continuation-token", default=None)
 
-    put = subparsers.add_parser("PUT", aliases=["put"], help="Upload object")
-    put.add_argument("bucket")
-    put.add_argument("key")
-    put.add_argument("file", help="Local file path")
-    put.add_argument("--content-type", default=None)
+    put_parser = subparsers.add_parser("PUT", aliases=["put"], help="Upload object")
+    put_parser.add_argument("bucket")
+    put_parser.add_argument("key")
+    put_parser.add_argument("file", help="Local file path")
+    put_parser.add_argument("--content-type", default=None)
 
-    get = subparsers.add_parser("GET", aliases=["get"], help="Download object")
-    get.add_argument("bucket")
-    get.add_argument("key")
-    get.add_argument("output", help="Output file path")
-    get.add_argument("--range", dest="range_header", default=None, help='HTTP Range header value, e.g. "bytes=0-99"')
+    get_parser = subparsers.add_parser("GET", aliases=["get"], help="Download object")
+    get_parser.add_argument("bucket")
+    get_parser.add_argument("key")
+    get_parser.add_argument("output", help="Output file path")
+    get_parser.add_argument("--range", dest="range_header", default=None)
 
     rm = subparsers.add_parser("DELETE", aliases=["rm"], help="Delete object")
     rm.add_argument("bucket")
@@ -320,24 +210,17 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    try:
-        client = LocalS3Client(base_url=args.endpoint, timeout=args.timeout, disable_proxy=args.disable_proxy)
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    cmd_map = {
+    client = LocalS3Client(base_url=args.endpoint, timeout=args.timeout, disable_proxy=args.disable_proxy)
+    command = {
         "health": "HEALTH",
         "lsb": "LIST_BUCKETS",
         "mb": "CREATE_BUCKET",
         "rb": "DELETE_BUCKET",
         "lso": "LIST_OBJECTS",
-        "LIST_OBJECTS_V2": "LIST_OBJECTS_V2",
         "put": "PUT",
         "get": "GET",
         "rm": "DELETE",
-    }
-    command = cmd_map.get(args.command, args.command)
+    }.get(args.command, args.command)
 
     try:
         if command == "HEALTH":
@@ -350,51 +233,27 @@ def main(argv: list[str] | None = None) -> int:
             client.delete_bucket(args.bucket)
             print(f"deleted bucket: {args.bucket}")
         elif command == "LIST_OBJECTS":
-            objects = client.list_objects(args.bucket, prefix=args.prefix, limit=args.limit)
-            print(json.dumps(objects, ensure_ascii=False, indent=2))
+            print(json.dumps(client.list_objects(args.bucket, prefix=args.prefix, limit=args.limit), ensure_ascii=False, indent=2))
         elif command == "LIST_OBJECTS_V2":
-            result = client.list_objects_v2(
-                bucket=args.bucket,
-                prefix=args.prefix,
-                delimiter=args.delimiter,
-                max_keys=args.max_keys,
-                continuation_token=args.continuation_token,
-            )
+            result = client.list_objects_v2(args.bucket, args.prefix, args.delimiter, args.max_keys, args.continuation_token)
             print(json.dumps(result, ensure_ascii=False, indent=2))
         elif command == "PUT":
-            file_path = Path(args.file)
-            result = client.put_object(
-                bucket=args.bucket,
-                key=args.key,
-                file_path=file_path,
-                content_type=args.content_type,
-            )
-            print(json.dumps(result, ensure_ascii=False, indent=2))
+            print(json.dumps(client.put_object(args.bucket, args.key, Path(args.file), args.content_type), ensure_ascii=False, indent=2))
         elif command == "GET":
-            output_path = Path(args.output)
-            headers = client.get_object_to_file(args.bucket, args.key, output_path, range_header=args.range_header)
+            headers = client.get_object_to_file(args.bucket, args.key, Path(args.output), args.range_header)
             content_range = headers.get("content-range")
             if content_range:
-                print(f"downloaded range to: {output_path} ({content_range})")
+                print(f"downloaded range to: {args.output} ({content_range})")
             else:
-                print(f"downloaded to: {output_path}")
+                print(f"downloaded to: {args.output}")
         elif command == "DELETE":
             client.delete_object(args.bucket, args.key)
             print(f"deleted object: {args.bucket}/{args.key}")
         else:
             parser.print_help()
             return 2
-    except FileNotFoundError as exc:
-        print(f"file not found: {exc}", file=sys.stderr)
-        return 1
-    except Exception as exc:
-        if httpx is not None and isinstance(exc, httpx.HTTPError):
-            print(f"http error: {exc}", file=sys.stderr)
-            return 1
-        raise
     finally:
         client.close()
-
     return 0
 
 

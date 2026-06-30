@@ -1,6 +1,6 @@
 # alocals3
 
-基于 FastAPI 的本地文件系统 S3 风格服务（项目骨架）。
+本地文件系统 S3 风格服务：server 是纯 Rust 二进制，Python client 是 Rust 网络实现的 wheel 包。
 
 ## 快速启动
 
@@ -8,50 +8,46 @@
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-python -m alocals3.server --reload
-# 或者通过命令行覆盖数据库连接串
-python -m alocals3.server --database-url "sqlite:////absolute/path/alocals3.db" --reload
-# 设置应用日志级别
-python -m alocals3.server --log-level WARNING
+cargo build --release --bin alocals3-server
+target/release/alocals3-server \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --database-url "sqlite:///./alocals3.db" \
+  --storage-root ./data
 ```
 
-## Rust 存储后端
+## Rust Server 与 Python Client
 
-`main` 分支通过 `maturin` 构建 PyO3 扩展模块 `alocals3._rust`。当数据库连接串为 SQLite 时，FastAPI server 默认使用 Rust 存储后端；如果扩展不可用，或配置了非 SQLite 数据库连接串，则回退到原 Python/SQLAlchemy 后端。
+server 是 `alocals3-server` Rust 二进制，不依赖 Python。元数据后端支持 SQLite 和 PostgreSQL，对象内容仍然存放在本地磁盘。
 
 ```bash
-pip install -e .
-python -m alocals3.server --database-url "sqlite:///./alocals3.db"
+# SQLite
+target/release/alocals3-server --database-url "sqlite:///./alocals3.db"
+
+# PostgreSQL
+target/release/alocals3-server \
+  --database-url "postgresql://user:password@127.0.0.1:5432/alocals3"
 ```
 
-HTTP S3 兼容 API 保持不变。Python client 继续通过 `LocalS3ClientAsync` 接入 asyncio 生态。
-
-本地纯写入 stress benchmark，10 秒、50 并发、4KiB 对象、SQLite WAL、关闭 uvicorn access log：
-
-- `pre-rust`: 213.45 ops/s，p50 161.57 ms，p95 725.38 ms，p99 1218.26 ms
-- `main` Rust/PyO3 storage: 104.59 ops/s，p50 480.92 ms，p95 607.50 ms，p99 683.51 ms
-
-当前 PyO3 存储替换已经功能兼容，但在写密集场景下还不是吞吐提升。下一步性能优化应把 HTTP server 热路径也迁到 Rust，避免 Python ASGI/PyO3 边界开销。
+Python 包通过 `maturin` 构建 wheel，提供 `LocalS3Client` 和 `LocalS3ClientAsync`。HTTP 网络功能在 Rust `reqwest` 中实现，不再依赖 `httpx`。
 
 ## 配置
 
-- `ALOCALS3_APP_NAME`: 应用名，默认 `alocals3`
 - `ALOCALS3_STORAGE_ROOT`: 本地对象数据目录，默认 `./data`
 - `ALOCALS3_DATABASE_URL`: 数据库连接串，默认 `sqlite:///./alocals3.db`
-- `ALOCALS3_LOG_LEVEL`: 日志级别，默认 `INFO`（可选 `DEBUG/INFO/WARNING/ERROR/CRITICAL`）
 
 示例：
 
 - SQLite: `sqlite:///./alocals3.db`
-- PostgreSQL: `postgresql+psycopg://user:password@127.0.0.1:5432/alocals3`
+- PostgreSQL: `postgresql://user:password@127.0.0.1:5432/alocals3`
 
 说明：SQLite 连接串建议使用绝对路径，避免因启动目录不同导致读写到不同数据库文件。
-并发写场景下，SQLite 默认已开启 `WAL` + `busy_timeout`，并对 `database is locked` 做短重试。
+并发写场景下，SQLite 默认已开启 `WAL` + `busy_timeout`。
 生产环境建议优先使用 PostgreSQL。
 
 ## 存储策略
 
-- key/元数据索引存放在数据库（SQLite 默认走 Rust/PyO3；PostgreSQL 或扩展缺失时回退 Python/SQLAlchemy）
+- key/元数据索引由 Rust server 写入 SQLite 或 PostgreSQL
 - 对象内容存放在本地磁盘
 - 文件路径使用 hash 分片：
   - `sha256(<object bytes>) = <digest>`

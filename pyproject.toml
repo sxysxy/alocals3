@@ -5,14 +5,14 @@ build-backend = "maturin"
 [project]
 name = "alocals3"
 version = "0.4.0"
-description = "alocals3: A local-storage based S3-like service(including server and client), powered by FastAPI"
+description = "alocals3: a Rust S3-like server and Rust-backed Python client"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 authors = [
   { name = "alocals3 contributors" }
 ]
-keywords = ["s3", "fastapi", "local"]
+keywords = ["s3", "rust", "local"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
@@ -21,20 +21,16 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
-  "Framework :: FastAPI",
 ]
-dependencies = [
+dependencies = []
+
+[project.optional-dependencies]
+legacy-python-server = [
   "fastapi>=0.115.0",
   "uvicorn>=0.30.0",
-  "httpx>=0.27.0",
   "pydantic>=2.8.0",
   "sqlalchemy>=2.0.0",
   "eval-type-backport>=0.2.0; python_version<'3.10'",
-]
-
-[project.optional-dependencies]
-postgres = [
-  "psycopg[binary]>=3.1.0",
 ]
 
 [project.urls]
@@ -42,11 +38,10 @@ Homepage = "https://github.com/sxysxy/alocals3"
 Repository = "https://github.com/sxysxy/alocals3"
 
 [project.scripts]
-alocals3-server = "alocals3.server:main"
 alocals3-client = "alocals3.client:main"
-alocals3-gc = "alocals3.gc:main"
 
 [tool.maturin]
 module-name = "alocals3._rust"
 python-source = "."
+features = ["extension-module"]
 include = ["alocals3/**/*", "README.md", "README.zh-CN.md", "LICENSE"]

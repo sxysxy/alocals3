@@ -2,7 +2,7 @@
 
 # alocals3
 
-A local-storage-based S3-like service (server + client) powered by FastAPI.
+A local-storage-based S3-like service with a pure Rust server and a Rust-backed Python client.
 
 ## Quick Start
 
@@ -10,50 +10,46 @@ A local-storage-based S3-like service (server + client) powered by FastAPI.
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-python -m alocals3.server --reload
-# override DB URL from CLI
-python -m alocals3.server --database-url "sqlite:////absolute/path/alocals3.db" --reload
-# set application log level
-python -m alocals3.server --log-level WARNING
+cargo build --release --bin alocals3-server
+target/release/alocals3-server \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --database-url "sqlite:///./alocals3.db" \
+  --storage-root ./data
 ```
 
-## Rust Storage Backend
+## Rust Server And Python Client
 
-The `main` branch builds a PyO3 extension module, `alocals3._rust`, through `maturin`. For SQLite database URLs, the FastAPI server uses the Rust storage backend by default and falls back to the original Python/SQLAlchemy backend when the extension is unavailable or when a non-SQLite database URL is configured.
+The server is the `alocals3-server` Rust binary and does not use Python. It supports both SQLite and PostgreSQL metadata backends while storing object payloads on local disk.
 
 ```bash
-pip install -e .
-python -m alocals3.server --database-url "sqlite:///./alocals3.db"
+# SQLite
+target/release/alocals3-server --database-url "sqlite:///./alocals3.db"
+
+# PostgreSQL
+target/release/alocals3-server \
+  --database-url "postgresql://user:password@127.0.0.1:5432/alocals3"
 ```
 
-The HTTP S3-compatible API is unchanged. The Python client remains asyncio-friendly through `LocalS3ClientAsync`.
-
-Local write-only stress benchmark, 10s, 50 concurrency, 4KiB objects, SQLite WAL, uvicorn access log disabled:
-
-- `pre-rust`: 213.45 ops/s, p50 161.57 ms, p95 725.38 ms, p99 1218.26 ms
-- `main` Rust/PyO3 storage: 104.59 ops/s, p50 480.92 ms, p95 607.50 ms, p99 683.51 ms
-
-The current PyO3 storage swap is functionally compatible but not yet a throughput win for write-heavy workloads. The next performance step should move the HTTP server path itself to Rust, avoiding the Python ASGI/PyO3 boundary for hot requests.
+The Python package is a wheel built with `maturin`. It exposes `LocalS3Client` and `LocalS3ClientAsync`, but the HTTP networking is implemented in Rust through `reqwest`, not `httpx`.
 
 ## Configuration
 
-- `ALOCALS3_APP_NAME`: app name, default `alocals3`
 - `ALOCALS3_STORAGE_ROOT`: object storage root, default `./data`
 - `ALOCALS3_DATABASE_URL`: database URL, default `sqlite:///./alocals3.db`
-- `ALOCALS3_LOG_LEVEL`: log level, default `INFO` (`DEBUG/INFO/WARNING/ERROR/CRITICAL`)
 
 Examples:
 
 - SQLite: `sqlite:///./alocals3.db`
-- PostgreSQL: `postgresql+psycopg://user:password@127.0.0.1:5432/alocals3`
+- PostgreSQL: `postgresql://user:password@127.0.0.1:5432/alocals3`
 
 Note: for SQLite, prefer an absolute path to avoid writing to different DB files due to different working directories.
-For concurrent writes, SQLite is configured with `WAL` + `busy_timeout`, and write transactions apply short retry on `database is locked`.
+For concurrent writes, SQLite is configured with `WAL` + `busy_timeout`.
 For production workloads, PostgreSQL is strongly recommended.
 
 ## Storage Strategy
 
-- Key/object metadata is indexed in DB (Rust/PyO3 for SQLite; Python/SQLAlchemy fallback for PostgreSQL or missing extension)
+- Key/object metadata is indexed in SQLite or PostgreSQL by the Rust server
 - Object payload is stored on local disk
 - Blob file path uses hash sharding:
   - `sha256(<object bytes>) = <digest>`

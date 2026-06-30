@@ -1,4 +1,5 @@
 use chrono::{SecondsFormat, Utc};
+use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyModule};
@@ -13,12 +14,195 @@ use uuid::Uuid;
 
 const ERR_PREFIX: &str = "ALOCALS3_STORAGE_ERROR:";
 const SQLITE_POOL_SIZE: usize = 16;
+const KEY_ENCODE_SET: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC.remove(b'/');
 
 #[pyclass]
 struct RustStorageBackend {
     objects_root: PathBuf,
     conn_pool: Vec<Mutex<Connection>>,
     next_conn: AtomicUsize,
+}
+
+#[pyclass]
+struct RustHttpClient {
+    base_url: String,
+    client: reqwest::blocking::Client,
+}
+
+#[pymethods]
+impl RustHttpClient {
+    #[new]
+    #[pyo3(signature = (base_url="http://127.0.0.1:8000", timeout=10.0, disable_proxy=false))]
+    fn new(base_url: &str, timeout: f64, disable_proxy: bool) -> PyResult<Self> {
+        let mut builder = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs_f64(timeout.max(0.001)));
+        if disable_proxy {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build().map_err(http_error)?;
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client,
+        })
+    }
+
+    fn health_json(&self) -> PyResult<String> {
+        self.request_json(self.client.get(self.url("/healthz")))
+    }
+
+    fn list_buckets_json(&self) -> PyResult<String> {
+        self.request_json(self.client.get(self.url("/s3")))
+    }
+
+    fn create_bucket_json(&self, bucket: &str) -> PyResult<String> {
+        self.request_json(self.client.put(self.url(&bucket_path(bucket))))
+    }
+
+    fn delete_bucket(&self, bucket: &str) -> PyResult<()> {
+        self.request_empty(self.client.delete(self.url(&bucket_path(bucket))))
+    }
+
+    #[pyo3(signature = (bucket, prefix=None, limit=1000))]
+    fn list_objects_json(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        let mut request = self
+            .client
+            .get(self.url(&format!("{}/objects", bucket_path(bucket))))
+            .query(&[("limit", limit.to_string())]);
+        if let Some(prefix) = prefix {
+            request = request.query(&[("prefix", prefix)]);
+        }
+        self.request_json(request)
+    }
+
+    #[pyo3(signature = (bucket, prefix="", delimiter="", max_keys=1000, continuation_token=None))]
+    fn list_objects_v2_json(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: &str,
+        max_keys: i64,
+        continuation_token: Option<&str>,
+    ) -> PyResult<String> {
+        let mut query = vec![
+            ("list-type", "2".to_string()),
+            ("prefix", prefix.to_string()),
+            ("delimiter", delimiter.to_string()),
+            ("max-keys", max_keys.to_string()),
+            ("output", "json".to_string()),
+        ];
+        if let Some(token) = continuation_token {
+            query.push(("continuation-token", token.to_string()));
+        }
+        self.request_json(
+            self.client
+                .get(self.url(&bucket_path(bucket)))
+                .query(&query),
+        )
+    }
+
+    #[pyo3(signature = (bucket, key, file_path, content_type=None))]
+    fn put_object_json(
+        &self,
+        bucket: &str,
+        key: &str,
+        file_path: &str,
+        content_type: Option<&str>,
+    ) -> PyResult<String> {
+        let body = fs::read(file_path).map_err(io_error)?;
+        let mut request = self
+            .client
+            .put(self.url(&object_path(bucket, key)))
+            .body(body);
+        if let Some(content_type) = content_type {
+            request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+        }
+        self.request_json(request)
+    }
+
+    #[pyo3(signature = (bucket, key, output_path, range_header=None))]
+    fn get_object_to_file(
+        &self,
+        py: Python<'_>,
+        bucket: &str,
+        key: &str,
+        output_path: &str,
+        range_header: Option<&str>,
+    ) -> PyResult<PyObject> {
+        let mut request = self.client.get(self.url(&object_path(bucket, key)));
+        if let Some(range_header) = range_header {
+            request = request.header(reqwest::header::RANGE, range_header);
+        }
+        let response = request.send().map_err(http_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_status_error(status.as_u16()));
+        }
+        let headers = response.headers().clone();
+        let body = response.bytes().map_err(http_error)?;
+        if let Some(parent) = Path::new(output_path).parent() {
+            fs::create_dir_all(parent).map_err(io_error)?;
+        }
+        fs::write(output_path, &body).map_err(io_error)?;
+        headers_to_dict(py, &headers)
+    }
+
+    fn get_object_range(
+        &self,
+        py: Python<'_>,
+        bucket: &str,
+        key: &str,
+        range_header: &str,
+    ) -> PyResult<PyObject> {
+        let response = self
+            .client
+            .get(self.url(&object_path(bucket, key)))
+            .header(reqwest::header::RANGE, range_header)
+            .send()
+            .map_err(http_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_status_error(status.as_u16()));
+        }
+        let headers = response.headers().clone();
+        let body = response.bytes().map_err(http_error)?;
+        let result = PyDict::new_bound(py);
+        result.set_item("body", PyBytes::new_bound(py, &body))?;
+        result.set_item("headers", headers_to_dict(py, &headers)?)?;
+        Ok(result.into())
+    }
+
+    fn delete_object(&self, bucket: &str, key: &str) -> PyResult<()> {
+        self.request_empty(self.client.delete(self.url(&object_path(bucket, key))))
+    }
+}
+
+impl RustHttpClient {
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+
+    fn request_json(&self, request: reqwest::blocking::RequestBuilder) -> PyResult<String> {
+        let response = request.send().map_err(http_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_status_error(status.as_u16()));
+        }
+        response.text().map_err(http_error)
+    }
+
+    fn request_empty(&self, request: reqwest::blocking::RequestBuilder) -> PyResult<()> {
+        let response = request.send().map_err(http_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_status_error(status.as_u16()));
+        }
+        Ok(())
+    }
 }
 
 #[pymethods]
@@ -240,12 +424,7 @@ impl RustStorageBackend {
         let body = body.to_vec();
         let (info_data, created) = py
             .allow_threads(|| {
-                self.put_object_with_state_inner(
-                    &bucket,
-                    &key,
-                    &body,
-                    content_type.as_deref(),
-                )
+                self.put_object_with_state_inner(&bucket, &key, &body, content_type.as_deref())
             })
             .map_err(storage_failure_to_py)?;
         let info = object_info_data_dict(py, &info_data)?;
@@ -263,13 +442,26 @@ impl RustStorageBackend {
         let row = object_record(&conn, bucket_id, &key)?;
         let body = fs::read(self.objects_root.join(&row.file_path))
             .map_err(|_| storage_error(404, "Object data missing"))?;
-        let info = object_info_dict(py, &bucket, &row.key, row.size, &row.content_type, &row.etag, &row.updated_at)?;
+        let info = object_info_dict(
+            py,
+            &bucket,
+            &row.key,
+            row.size,
+            &row.content_type,
+            &row.etag,
+            &row.updated_at,
+        )?;
         let dict = info.downcast_bound::<PyDict>(py)?;
         dict.set_item("body", PyBytes::new_bound(py, &body))?;
         Ok(info)
     }
 
-    fn get_object_info(&self, py: Python<'_>, bucket: String, key: String) -> PyResult<Option<PyObject>> {
+    fn get_object_info(
+        &self,
+        py: Python<'_>,
+        bucket: String,
+        key: String,
+    ) -> PyResult<Option<PyObject>> {
         validate_bucket(&bucket)?;
         let key = normalize_key(&key)?;
         let conn = self.conn()?;
@@ -338,6 +530,7 @@ impl RustStorageBackend {
 #[pymodule]
 fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RustStorageBackend>()?;
+    m.add_class::<RustHttpClient>()?;
     Ok(())
 }
 
@@ -428,9 +621,12 @@ impl RustStorageBackend {
 }
 
 fn init_connection(conn: &Connection) -> PyResult<()> {
-    conn.pragma_update(None, "journal_mode", "WAL").map_err(db_error)?;
-    conn.pragma_update(None, "busy_timeout", 10_000).map_err(db_error)?;
-    conn.pragma_update(None, "synchronous", "NORMAL").map_err(db_error)?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(db_error)?;
+    conn.pragma_update(None, "busy_timeout", 10_000)
+        .map_err(db_error)?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(db_error)?;
     conn.execute_batch(
         "\
         CREATE TABLE IF NOT EXISTS buckets (\
@@ -544,7 +740,12 @@ fn object_info_data_dict(py: Python<'_>, data: &ObjectInfoData) -> PyResult<PyOb
     )
 }
 
-fn object_info_from_row(py: Python<'_>, bucket: &str, key: &str, row: &rusqlite::Row<'_>) -> PyResult<PyObject> {
+fn object_info_from_row(
+    py: Python<'_>,
+    bucket: &str,
+    key: &str,
+    row: &rusqlite::Row<'_>,
+) -> PyResult<PyObject> {
     object_info_dict(
         py,
         bucket,
@@ -577,7 +778,12 @@ fn object_info_dict(
 
 fn validate_bucket(bucket: &str) -> PyResult<()> {
     ensure_utf8(bucket, "bucket")?;
-    if bucket.is_empty() || bucket.contains('/') || bucket.contains('\\') || bucket == "." || bucket == ".." {
+    if bucket.is_empty()
+        || bucket.contains('/')
+        || bucket.contains('\\')
+        || bucket == "."
+        || bucket == ".."
+    {
         return Err(storage_error(422, "Invalid bucket name"));
     }
     Ok(())
@@ -622,7 +828,11 @@ fn object_id_inner(tx: &Transaction<'_>, bucket_id: i64, key: &str) -> StorageRe
     .map_err(db_failure)
 }
 
-fn object_record_inner(conn: &Connection, bucket_id: i64, key: &str) -> StorageResult<ObjectRecord> {
+fn object_record_inner(
+    conn: &Connection,
+    bucket_id: i64,
+    key: &str,
+) -> StorageResult<ObjectRecord> {
     conn.query_row(
         "SELECT key, size, content_type, etag, updated_at, file_path \
          FROM objects WHERE bucket_id = ?1 AND key = ?2",
@@ -645,7 +855,12 @@ fn object_record_inner(conn: &Connection, bucket_id: i64, key: &str) -> StorageR
 
 fn validate_bucket_inner(bucket: &str) -> StorageResult<()> {
     ensure_utf8_inner(bucket, "bucket")?;
-    if bucket.is_empty() || bucket.contains('/') || bucket.contains('\\') || bucket == "." || bucket == ".." {
+    if bucket.is_empty()
+        || bucket.contains('/')
+        || bucket.contains('\\')
+        || bucket == "."
+        || bucket == ".."
+    {
         return Err(storage_failure(422, "Invalid bucket name"));
     }
     Ok(())
@@ -733,4 +948,38 @@ fn db_error(err: rusqlite::Error) -> PyErr {
 
 fn io_error(err: std::io::Error) -> PyErr {
     PyRuntimeError::new_err(format!("{ERR_PREFIX}500:I/O error: {err}"))
+}
+
+fn http_error(err: reqwest::Error) -> PyErr {
+    PyRuntimeError::new_err(format!("ALOCALS3_HTTP_ERROR:{err}"))
+}
+
+fn http_status_error(status: u16) -> PyErr {
+    PyRuntimeError::new_err(format!("ALOCALS3_HTTP_STATUS:{status}"))
+}
+
+fn headers_to_dict(py: Python<'_>, headers: &reqwest::header::HeaderMap) -> PyResult<PyObject> {
+    let dict = PyDict::new_bound(py);
+    for (name, value) in headers.iter() {
+        if let Ok(value) = value.to_str() {
+            dict.set_item(name.as_str().to_ascii_lowercase(), value)?;
+        }
+    }
+    Ok(dict.into())
+}
+
+fn bucket_path(bucket: &str) -> String {
+    format!("/s3/{}", encode_segment(bucket))
+}
+
+fn object_path(bucket: &str, key: &str) -> String {
+    format!("{}/{}", bucket_path(bucket), encode_key(key))
+}
+
+fn encode_segment(value: &str) -> String {
+    percent_encode(value.as_bytes(), NON_ALPHANUMERIC).to_string()
+}
+
+fn encode_key(value: &str) -> String {
+    percent_encode(value.as_bytes(), KEY_ENCODE_SET).to_string()
 }

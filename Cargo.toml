@@ -5,17 +5,39 @@ edition = "2021"
 
 [lib]
 name = "_rust"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "alocals3-server"
+path = "src/bin/alocals3-server.rs"
 
 [dependencies]
+axum = "0.7"
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive", "env"] }
+http = "1"
 md5 = "0.7"
 mime_guess = "2"
-pyo3 = { version = "0.21", features = ["extension-module", "abi3-py39"] }
+percent-encoding = "2"
+pyo3 = { version = "0.21", features = ["abi3-py39"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "net", "signal"] }
+tower-http = { version = "0.6", features = ["trace"] }
 uuid = { version = "1", features = ["v4"] }
 
 [package.metadata.maturin]
 module-name = "alocals3._rust"
 python-source = "."
+features = ["extension-module"]
+
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]

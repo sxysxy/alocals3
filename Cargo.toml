@@ -1,0 +1,21 @@
+[package]
+name = "alocals3-rust"
+version = "0.4.0"
+edition = "2021"
+
+[lib]
+name = "_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+md5 = "0.7"
+mime_guess = "2"
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py39"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[package.metadata.maturin]
+module-name = "alocals3._rust"
+python-source = "."

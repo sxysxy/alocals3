@@ -1,7 +1,10 @@
 __pycache__
 *.pyc
+*.so
 build
 dist
+target
+.venv
 *.egg-info
 alocals3.db
 alocals3.db-shm

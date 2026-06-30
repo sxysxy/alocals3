@@ -7,13 +7,31 @@
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 python -m alocals3.server --reload
 # 或者通过命令行覆盖数据库连接串
 python -m alocals3.server --database-url "sqlite:////absolute/path/alocals3.db" --reload
 # 设置应用日志级别
 python -m alocals3.server --log-level WARNING
 ```
+
+## Rust 存储后端
+
+`main` 分支通过 `maturin` 构建 PyO3 扩展模块 `alocals3._rust`。当数据库连接串为 SQLite 时，FastAPI server 默认使用 Rust 存储后端；如果扩展不可用，或配置了非 SQLite 数据库连接串，则回退到原 Python/SQLAlchemy 后端。
+
+```bash
+pip install -e .
+python -m alocals3.server --database-url "sqlite:///./alocals3.db"
+```
+
+HTTP S3 兼容 API 保持不变。Python client 继续通过 `LocalS3ClientAsync` 接入 asyncio 生态。
+
+本地纯写入 stress benchmark，10 秒、50 并发、4KiB 对象、SQLite WAL、关闭 uvicorn access log：
+
+- `pre-rust`: 213.45 ops/s，p50 161.57 ms，p95 725.38 ms，p99 1218.26 ms
+- `main` Rust/PyO3 storage: 104.59 ops/s，p50 480.92 ms，p95 607.50 ms，p99 683.51 ms
+
+当前 PyO3 存储替换已经功能兼容，但在写密集场景下还不是吞吐提升。下一步性能优化应把 HTTP server 热路径也迁到 Rust，避免 Python ASGI/PyO3 边界开销。
 
 ## 配置
 
@@ -33,7 +51,7 @@ python -m alocals3.server --log-level WARNING
 
 ## 存储策略
 
-- key/元数据索引存放在数据库（SQLAlchemy，支持 SQLite/PostgreSQL）
+- key/元数据索引存放在数据库（SQLite 默认走 Rust/PyO3；PostgreSQL 或扩展缺失时回退 Python/SQLAlchemy）
 - 对象内容存放在本地磁盘
 - 文件路径使用 hash 分片：
   - `sha256(<object bytes>) = <digest>`

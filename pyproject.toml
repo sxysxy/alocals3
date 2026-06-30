@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
 
 [project]
 name = "alocals3"
-version = "0.3.0"
+version = "0.4.0"
 description = "alocals3: A local-storage based S3-like service(including server and client), powered by FastAPI"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -29,6 +29,7 @@ dependencies = [
   "httpx>=0.27.0",
   "pydantic>=2.8.0",
   "sqlalchemy>=2.0.0",
+  "eval-type-backport>=0.2.0; python_version<'3.10'",
 ]
 
 [project.optional-dependencies]
@@ -45,9 +46,7 @@ alocals3-server = "alocals3.server:main"
 alocals3-client = "alocals3.client:main"
 alocals3-gc = "alocals3.gc:main"
 
-[tool.setuptools]
-include-package-data = true
-
-[tool.setuptools.packages.find]
-include = ["alocals3*"]
-exclude = ["examples*", "tests*"]
+[tool.maturin]
+module-name = "alocals3._rust"
+python-source = "."
+include = ["alocals3/**/*", "README.md", "README.zh-CN.md", "LICENSE"]

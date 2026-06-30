@@ -1,7 +1,7 @@
 use chrono::{SecondsFormat, Utc};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList, PyModule};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -55,9 +55,9 @@ impl RustStorageBackend {
             .prepare("SELECT name, created_at FROM buckets ORDER BY name ASC")
             .map_err(db_error)?;
         let mut rows = stmt.query([]).map_err(db_error)?;
-        let out = PyList::empty(py);
+        let out = PyList::empty_bound(py);
         while let Some(row) = rows.next().map_err(db_error)? {
-            let item = PyDict::new(py);
+            let item = PyDict::new_bound(py);
             item.set_item("name", row.get::<_, String>(0).map_err(db_error)?)?;
             item.set_item("created_at", row.get::<_, String>(1).map_err(db_error)?)?;
             out.append(item)?;
@@ -122,7 +122,7 @@ impl RustStorageBackend {
             )
             .map_err(db_error)?;
         let mut rows = stmt.query(params![bucket_id]).map_err(db_error)?;
-        let out = PyList::empty(py);
+        let out = PyList::empty_bound(py);
         while let Some(row) = rows.next().map_err(db_error)? {
             let key: String = row.get(0).map_err(db_error)?;
             if !prefix.is_empty() && !key.starts_with(&prefix) {
@@ -169,8 +169,8 @@ impl RustStorageBackend {
             .map_err(db_error)?;
         let mut rows = stmt.query(params![bucket_id]).map_err(db_error)?;
 
-        let contents = PyList::empty(py);
-        let common_prefixes = PyList::empty(py);
+        let contents = PyList::empty_bound(py);
+        let common_prefixes = PyList::empty_bound(py);
         let mut common_prefix_set: Vec<String> = Vec::new();
         let mut key_count = 0_i64;
         let mut next_token: Option<String> = None;
@@ -215,7 +215,7 @@ impl RustStorageBackend {
             key_count += 1;
         }
 
-        let result = PyDict::new(py);
+        let result = PyDict::new_bound(py);
         result.set_item("bucket", bucket)?;
         result.set_item("prefix", prefix)?;
         result.set_item("delimiter", delimiter)?;
@@ -249,7 +249,7 @@ impl RustStorageBackend {
             })
             .map_err(storage_failure_to_py)?;
         let info = object_info_data_dict(py, &info_data)?;
-        let result = PyDict::new(py);
+        let result = PyDict::new_bound(py);
         result.set_item("info", info)?;
         result.set_item("created", created)?;
         Ok(result.into())
@@ -264,8 +264,8 @@ impl RustStorageBackend {
         let body = fs::read(self.objects_root.join(&row.file_path))
             .map_err(|_| storage_error(404, "Object data missing"))?;
         let info = object_info_dict(py, &bucket, &row.key, row.size, &row.content_type, &row.etag, &row.updated_at)?;
-        let dict = info.downcast::<PyDict>(py)?;
-        dict.set_item("body", PyBytes::new(py, &body))?;
+        let dict = info.downcast_bound::<PyDict>(py)?;
+        dict.set_item("body", PyBytes::new_bound(py, &body))?;
         Ok(info)
     }
 
@@ -336,7 +336,7 @@ impl RustStorageBackend {
 }
 
 #[pymodule]
-fn _rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+fn _rust(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RustStorageBackend>()?;
     Ok(())
 }
@@ -513,7 +513,7 @@ fn bucket_info(py: Python<'_>, conn: &Connection, bucket: &str) -> PyResult<PyOb
             |row| row.get(0),
         )
         .map_err(db_error)?;
-    let dict = PyDict::new(py);
+    let dict = PyDict::new_bound(py);
     dict.set_item("name", bucket)?;
     dict.set_item("created_at", created_at)?;
     Ok(dict.into())
@@ -565,7 +565,7 @@ fn object_info_dict(
     etag: &str,
     updated_at: &str,
 ) -> PyResult<PyObject> {
-    let dict = PyDict::new(py);
+    let dict = PyDict::new_bound(py);
     dict.set_item("bucket", bucket)?;
     dict.set_item("key", key)?;
     dict.set_item("size", size)?;

@@ -77,7 +77,7 @@ if [[ "$USE_DOCKER" == "1" ]]; then
     -v "$ROOT_DIR":/io \
     -w /io \
     "$MATURIN_IMAGE" \
-    maturin "${MATURIN_ARGS[@]}" \
+    "${MATURIN_ARGS[@]}" \
       --interpreter python3.12 \
       --out "$DOCKER_OUT_DIR"
 else

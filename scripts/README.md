@@ -43,6 +43,8 @@ WHEEL_COMPATIBILITY=manylinux_2_28 USE_ZIG=1 scripts/build-linux-release.sh
 
 GHCR does not publish every minor-only tag such as `v1.7`; use `latest` or a full patch tag such as `v1.14.1`.
 
+The official maturin container image uses `maturin` as its entrypoint, so the script passes subcommands such as `build` directly to the container.
+
 ## Windows
 
 Run from PowerShell on Windows 10 or newer:

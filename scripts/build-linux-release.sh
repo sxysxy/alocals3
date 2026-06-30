@@ -9,7 +9,7 @@ OUT_DIR="${OUT_DIR:-dist}"
 PYTHON="${PYTHON:-python3.12}"
 USE_DOCKER="${USE_DOCKER:-1}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-}"
-MATURIN_IMAGE="${MATURIN_IMAGE:-ghcr.io/pyo3/maturin:v1.7}"
+MATURIN_IMAGE="${MATURIN_IMAGE:-ghcr.io/pyo3/maturin:latest}"
 WHEEL_COMPATIBILITY="${WHEEL_COMPATIBILITY:-manylinux_2_28}"
 USE_ZIG="${USE_ZIG:-0}"
 
@@ -29,9 +29,13 @@ PYO3_NO_PYTHON=1 cargo build \
   --target "$TARGET"
 
 SERVER_SRC="target/$TARGET/release/alocals3-server"
-SERVER_DST="$OUT_DIR/alocals3-server-linux-${TARGET}"
+SERVER_DST="$OUT_DIR/alocals3-server"
 cp "$SERVER_SRC" "$SERVER_DST"
 chmod +x "$SERVER_DST"
+rm -rf "$ROOT_DIR/alocals3/bin"
+mkdir -p "$ROOT_DIR/alocals3/bin"
+cp "$SERVER_SRC" "$ROOT_DIR/alocals3/bin/alocals3-server"
+chmod +x "$ROOT_DIR/alocals3/bin/alocals3-server"
 
 if command -v ldd >/dev/null 2>&1; then
   echo "==> Linkage check"
@@ -84,4 +88,4 @@ else
 fi
 
 echo "==> Artifacts"
-ls -lh "$OUT_DIR"/alocals3-server-linux-"$TARGET" "$OUT_DIR"/*.whl
+ls -lh "$OUT_DIR"/alocals3-server "$OUT_DIR"/*.whl

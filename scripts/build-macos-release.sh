@@ -30,9 +30,13 @@ PYO3_NO_PYTHON=1 cargo build \
   --target "$TARGET"
 
 SERVER_SRC="target/$TARGET/release/alocals3-server"
-SERVER_DST="$OUT_DIR/alocals3-server-macos-${TARGET}"
+SERVER_DST="$OUT_DIR/alocals3-server"
 cp "$SERVER_SRC" "$SERVER_DST"
 chmod +x "$SERVER_DST"
+rm -rf "$ROOT_DIR/alocals3/bin"
+mkdir -p "$ROOT_DIR/alocals3/bin"
+cp "$SERVER_SRC" "$ROOT_DIR/alocals3/bin/alocals3-server"
+chmod +x "$ROOT_DIR/alocals3/bin/alocals3-server"
 
 echo "==> Building macOS cp312 abi3 wheel for $TARGET"
 "$PYTHON" -m pip install --upgrade "maturin>=1.7,<2"

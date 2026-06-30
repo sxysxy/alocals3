@@ -66,6 +66,8 @@ Linux server builds default to `x86_64-unknown-linux-musl`; Linux wheels default
 
 The wheel is configured as Python 3.12+ ABI3 via PyO3 `abi3-py312`. It is not a `cp312-cp312` wheel unless the ABI3 feature is removed.
 
+Platform wheels include the Rust server executable and install an `alocals3-server` command. Standalone server artifacts are also named `alocals3-server` on Unix-like platforms and `alocals3-server.exe` on Windows.
+
 ## Configuration
 
 Server CLI flags:

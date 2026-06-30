@@ -64,6 +64,8 @@ Linux server 默认目标是 `x86_64-unknown-linux-musl`；Linux wheel 默认目
 
 wheel 现在配置为 Python 3.12+ ABI3，也就是 PyO3 `abi3-py312`。它通常不是 `cp312-cp312` wheel；如果要构建严格绑定 CPython 3.12 的 wheel，需要移除 `abi3-py312`。
 
+平台 wheel 会内置 Rust server 可执行文件，并安装 `alocals3-server` 命令。独立 server 构建产物在类 Unix 平台也命名为 `alocals3-server`，Windows 平台命名为 `alocals3-server.exe`。
+
 ## 配置
 
 Server CLI 参数：

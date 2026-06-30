@@ -27,6 +27,7 @@ Repository = "https://github.com/sxysxy/alocals3"
 
 [project.scripts]
 alocals3-client = "alocals3.client:main"
+alocals3-server = "alocals3.server_bin:main"
 
 [tool.maturin]
 module-name = "alocals3._alocals3_native"
@@ -36,6 +37,8 @@ compatibility = "manylinux_2_28"
 include = [
   "alocals3/__init__.py",
   "alocals3/client.py",
+  "alocals3/server_bin.py",
+  "alocals3/bin/*",
   "README.md",
   "README.zh-CN.md",
   "LICENSE",

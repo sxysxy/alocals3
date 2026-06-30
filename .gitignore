@@ -11,4 +11,5 @@ alocals3.db-shm
 alocals3.db-wal
 data
 examples/.tmp
+alocals3/bin/alocals3-server*
 .DS_Store

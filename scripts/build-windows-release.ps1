@@ -38,12 +38,17 @@ try {
 
 if ($Target) {
     $ServerSrc = Join-Path "target" (Join-Path $Target "release\alocals3-server.exe")
-    $ServerDst = Join-Path $OutDir "alocals3-server-windows-$Target.exe"
 } else {
     $ServerSrc = "target\release\alocals3-server.exe"
-    $ServerDst = Join-Path $OutDir "alocals3-server-windows.exe"
 }
+$ServerDst = Join-Path $OutDir "alocals3-server.exe"
 Copy-Item -Force $ServerSrc $ServerDst
+$PackageBinDir = Join-Path $RootDir "alocals3\bin"
+if (Test-Path $PackageBinDir) {
+    Remove-Item -Recurse -Force $PackageBinDir
+}
+New-Item -ItemType Directory -Force -Path $PackageBinDir | Out-Null
+Copy-Item -Force $ServerSrc (Join-Path $PackageBinDir "alocals3-server.exe")
 
 Write-Host "==> Building Windows cp312 abi3 wheel"
 & $Python312 -m pip install --upgrade "maturin>=1.7,<2"
@@ -55,5 +60,5 @@ Write-Host "==> Building Windows cp312 abi3 wheel"
     --out $OutDir
 
 Write-Host "==> Artifacts"
-Get-ChildItem $OutDir -Filter "alocals3-server-windows*.exe"
+Get-ChildItem $OutDir -Filter "alocals3-server.exe"
 Get-ChildItem $OutDir -Filter "*.whl"

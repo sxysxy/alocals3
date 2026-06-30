@@ -24,8 +24,8 @@ scripts/build-linux-release.sh
 Defaults:
 
 - server target: `x86_64-unknown-linux-musl`
-- server output: `dist/alocals3-server-linux-x86_64-unknown-linux-musl`
-- wheel builder: `ghcr.io/pyo3/maturin:v1.7`
+- server output: `dist/alocals3-server`
+- wheel builder: `ghcr.io/pyo3/maturin:latest`
 - wheel compatibility tag: `manylinux_2_28`
 - container runtime: `docker` if available, otherwise `podman`
 
@@ -35,10 +35,13 @@ Useful overrides:
 TARGET=aarch64-unknown-linux-musl scripts/build-linux-release.sh
 USE_DOCKER=0 PYTHON=python3.12 scripts/build-linux-release.sh
 CONTAINER_RUNTIME=podman scripts/build-linux-release.sh
+MATURIN_IMAGE=ghcr.io/pyo3/maturin:v1.14.1 scripts/build-linux-release.sh
 WHEEL_COMPATIBILITY=manylinux_2_28 USE_ZIG=1 scripts/build-linux-release.sh
 ```
 
 `--compatibility manylinux_2_28` is always passed by default. If the build host links against a newer glibc and maturin refuses the wheel, install zig support and set `USE_ZIG=1` so maturin can target the requested manylinux baseline.
+
+GHCR does not publish every minor-only tag such as `v1.7`; use `latest` or a full patch tag such as `v1.14.1`.
 
 ## Windows
 
@@ -50,7 +53,7 @@ Run from PowerShell on Windows 10 or newer:
 
 Defaults:
 
-- server output: `dist\alocals3-server-windows.exe`
+- server output: `dist\alocals3-server.exe`
 - Python resolver: `py -3.12`
 
 Useful overrides:
@@ -73,7 +76,7 @@ Defaults:
 
 - target: `aarch64-apple-darwin`
 - deployment target: `MACOSX_DEPLOYMENT_TARGET=11.0`
-- server output: `dist/alocals3-server-macos-aarch64-apple-darwin`
+- server output: `dist/alocals3-server`
 
 Useful overrides:
 

@@ -28,6 +28,7 @@ Defaults:
 - wheel builder: `ghcr.io/pyo3/maturin:latest`
 - wheel compatibility tag: `manylinux_2_28`
 - container runtime: `docker` if available, otherwise `podman`
+- container network: `host`
 
 Useful overrides:
 
@@ -35,6 +36,7 @@ Useful overrides:
 TARGET=aarch64-unknown-linux-musl scripts/build-linux-release.sh
 USE_DOCKER=0 PYTHON=python3.12 scripts/build-linux-release.sh
 CONTAINER_RUNTIME=podman scripts/build-linux-release.sh
+CONTAINER_NETWORK=bridge scripts/build-linux-release.sh
 MATURIN_IMAGE=ghcr.io/pyo3/maturin:v1.14.1 scripts/build-linux-release.sh
 WHEEL_COMPATIBILITY=manylinux_2_28 USE_ZIG=1 scripts/build-linux-release.sh
 ```
@@ -44,6 +46,8 @@ WHEEL_COMPATIBILITY=manylinux_2_28 USE_ZIG=1 scripts/build-linux-release.sh
 GHCR does not publish every minor-only tag such as `v1.7`; use `latest` or a full patch tag such as `v1.14.1`.
 
 The official maturin container image uses `maturin` as its entrypoint, so the script passes subcommands such as `build` directly to the container.
+
+The Linux container build defaults to `--network host`. This avoids failures when Cargo inherits a proxy such as `HTTPS_PROXY=http://127.0.0.1:...`; with bridge networking, `127.0.0.1` points at the container instead of the host.
 
 ## Windows
 

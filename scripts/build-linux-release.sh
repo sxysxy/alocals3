@@ -9,6 +9,7 @@ OUT_DIR="${OUT_DIR:-dist}"
 PYTHON="${PYTHON:-python3.12}"
 USE_DOCKER="${USE_DOCKER:-1}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-}"
+CONTAINER_NETWORK="${CONTAINER_NETWORK:-host}"
 MATURIN_IMAGE="${MATURIN_IMAGE:-ghcr.io/pyo3/maturin:latest}"
 WHEEL_COMPATIBILITY="${WHEEL_COMPATIBILITY:-manylinux_2_28}"
 USE_ZIG="${USE_ZIG:-0}"
@@ -73,7 +74,11 @@ if [[ "$USE_DOCKER" == "1" ]]; then
   if [[ "$OUT_DIR" != /* ]]; then
     DOCKER_OUT_DIR="/io/$OUT_DIR"
   fi
-  "$CONTAINER_RUNTIME" run --rm \
+  CONTAINER_ARGS=(run --rm)
+  if [[ -n "$CONTAINER_NETWORK" ]]; then
+    CONTAINER_ARGS+=(--network "$CONTAINER_NETWORK")
+  fi
+  "$CONTAINER_RUNTIME" "${CONTAINER_ARGS[@]}" \
     -v "$ROOT_DIR":/io \
     -w /io \
     "$MATURIN_IMAGE" \

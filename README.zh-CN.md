@@ -192,24 +192,7 @@ curl -i -X PUT -H "Content-MD5: ${MD5_B64}" --data-binary @file.bin \
 - 对象字节内容通过临时文件和原子 rename 写入。
 - 元数据通过所选数据库后端提交。
 - 数据库和文件系统之间不是一个跨存储的全局事务。
-- 进程或机器异常退出时，可能产生孤儿 blob 文件，可通过离线 GC 清理。
-
-## Legacy Python 代码
-
-仓库里仍保留旧版 Python server/storage 模块，用于兼容和迁移。`main` 分支的推荐运行时是 Rust server。
-
-旧版 Python 路径可能需要安装可选依赖：
-
-```bash
-python -m pip install ".[legacy-python-server]"
-```
-
-离线 GC 当前仍是 Python 工具：
-
-```bash
-python -m alocals3.gc
-python -m alocals3.gc --apply
-```
+- 进程或机器异常退出时，可能产生孤儿 blob 文件。Python 包不再提供备用 storage backend 或 Python server 路径；运维清理应在请求路径之外处理。
 
 ## 更新记录
 

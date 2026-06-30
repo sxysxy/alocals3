@@ -21,15 +21,6 @@ classifiers = [
 ]
 dependencies = []
 
-[project.optional-dependencies]
-legacy-python-server = [
-  "fastapi>=0.115.0",
-  "uvicorn>=0.30.0",
-  "pydantic>=2.8.0",
-  "sqlalchemy>=2.0.0",
-  "eval-type-backport>=0.2.0; python_version<'3.10'",
-]
-
 [project.urls]
 Homepage = "https://github.com/sxysxy/alocals3"
 Repository = "https://github.com/sxysxy/alocals3"
@@ -41,14 +32,17 @@ alocals3-client = "alocals3.client:main"
 module-name = "alocals3._alocals3_native"
 python-source = "."
 features = ["extension-module"]
-include = ["alocals3/**/*", "README.md", "README.zh-CN.md", "LICENSE"]
+include = [
+  "alocals3/__init__.py",
+  "alocals3/client.py",
+  "README.md",
+  "README.zh-CN.md",
+  "LICENSE",
+]
 exclude = [
   "alocals3/_alocals3_native*.so",
   "alocals3/_alocals3_native*.pyd",
   "alocals3/_alocals3_native*.dll",
-  "alocals3/_rust*.so",
-  "alocals3/_rust*.pyd",
-  "alocals3/_rust*.dll",
   "alocals3/**/__pycache__/*",
   "alocals3/**/*.pyc",
 ]

@@ -194,24 +194,7 @@ curl -i -X PUT -H "Content-MD5: ${MD5_B64}" --data-binary @file.bin \
 - Object bytes are written through a temporary file and atomic rename.
 - Metadata updates are committed through the selected database backend.
 - This is not a single distributed transaction across database and filesystem.
-- Under process or machine failure, orphan blob files may exist and can be removed by offline GC.
-
-## Legacy Python Code
-
-The repository still contains the previous Python server/storage modules for compatibility and migration work. The Rust server is the intended runtime on `main`.
-
-Legacy Python paths may require optional dependencies:
-
-```bash
-python -m pip install ".[legacy-python-server]"
-```
-
-Offline GC is currently a Python utility:
-
-```bash
-python -m alocals3.gc
-python -m alocals3.gc --apply
-```
+- Under process or machine failure, orphan blob files may exist. The Python package no longer ships an alternate storage backend or Python server path; operational cleanup should be handled outside the request path.
 
 ## Updates
 

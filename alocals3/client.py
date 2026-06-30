@@ -7,11 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-try:
-    from alocals3._alocals3_native import RustHttpClient
-except ModuleNotFoundError:  # pragma: no cover - depends on extension build
-    RustHttpClient = None  # type: ignore[assignment]
-
+from alocals3._alocals3_native import RustHttpClient
 
 class LocalS3Client:
     def __init__(

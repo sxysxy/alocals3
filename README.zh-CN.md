@@ -60,7 +60,7 @@ scripts/build-macos-release.sh
 .\scripts\build-windows-release.ps1
 ```
 
-Linux server 默认目标是 `x86_64-unknown-linux-musl`。macOS 默认目标是 `aarch64-apple-darwin`，并设置 `MACOSX_DEPLOYMENT_TARGET=11.0`。
+Linux server 默认目标是 `x86_64-unknown-linux-musl`；Linux wheel 默认目标 tag 是 `manylinux_2_28`。macOS 默认目标是 `aarch64-apple-darwin`，并设置 `MACOSX_DEPLOYMENT_TARGET=11.0`。
 
 wheel 现在配置为 Python 3.12+ ABI3，也就是 PyO3 `abi3-py312`。它通常不是 `cp312-cp312` wheel；如果要构建严格绑定 CPython 3.12 的 wheel，需要移除 `abi3-py312`。
 
@@ -72,11 +72,14 @@ Server CLI 参数：
 - `--port`：监听端口，默认 `8000`
 - `--database-url`：SQLite 或 PostgreSQL 连接串
 - `--storage-root`：对象内容落盘目录
+- `--log-level`：日志级别或 `tracing_subscriber` 过滤 directive，默认 `info`
+- `--version`：输出 server 版本号和作者信息
 
 环境变量：
 
 - `ALOCALS3_DATABASE_URL`：默认 `sqlite:///./alocals3.db`
 - `ALOCALS3_STORAGE_ROOT`：默认 `./data`
+- `ALOCALS3_LOG_LEVEL`：默认 `info`
 
 连接串示例：
 
@@ -84,6 +87,8 @@ Server CLI 参数：
 - PostgreSQL：`postgresql://user:password@127.0.0.1:5432/alocals3`
 
 脚本和服务里建议给 SQLite 使用绝对路径，避免因为工作目录不同写到不同数据库。持续并发写入场景建议使用 PostgreSQL。
+
+日志输出到 stderr。常用级别包括 `debug`、`info`、`warn`、`error`；也支持完整 `EnvFilter` directive，例如 `warn,alocals3_server=debug`。
 
 ## 存储布局
 

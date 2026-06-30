@@ -62,7 +62,7 @@ scripts/build-macos-release.sh
 .\scripts\build-windows-release.ps1
 ```
 
-Linux server builds default to `x86_64-unknown-linux-musl`. macOS builds default to `aarch64-apple-darwin` with `MACOSX_DEPLOYMENT_TARGET=11.0`.
+Linux server builds default to `x86_64-unknown-linux-musl`; Linux wheels default to `manylinux_2_28`. macOS builds default to `aarch64-apple-darwin` with `MACOSX_DEPLOYMENT_TARGET=11.0`.
 
 The wheel is configured as Python 3.12+ ABI3 via PyO3 `abi3-py312`. It is not a `cp312-cp312` wheel unless the ABI3 feature is removed.
 
@@ -74,11 +74,14 @@ Server CLI flags:
 - `--port`: bind port, default `8000`
 - `--database-url`: SQLite or PostgreSQL URL
 - `--storage-root`: object payload root directory
+- `--log-level`: log level or `tracing_subscriber` filter directive, default `info`
+- `--version`: print server version and author information
 
 Environment variables:
 
 - `ALOCALS3_DATABASE_URL`: default `sqlite:///./alocals3.db`
 - `ALOCALS3_STORAGE_ROOT`: default `./data`
+- `ALOCALS3_LOG_LEVEL`: default `info`
 
 Database URL examples:
 
@@ -86,6 +89,8 @@ Database URL examples:
 - PostgreSQL: `postgresql://user:password@127.0.0.1:5432/alocals3`
 
 Use an absolute SQLite path in scripts and services to avoid accidentally writing to different database files from different working directories. PostgreSQL is recommended for sustained concurrent workloads.
+
+Logging is written to stderr. Common levels are `debug`, `info`, `warn`, and `error`; full `EnvFilter` directives such as `warn,alocals3_server=debug` are also accepted.
 
 ## Storage Layout
 

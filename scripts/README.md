@@ -26,13 +26,19 @@ Defaults:
 - server target: `x86_64-unknown-linux-musl`
 - server output: `dist/alocals3-server-linux-x86_64-unknown-linux-musl`
 - wheel builder: `ghcr.io/pyo3/maturin:v1.7`
+- wheel compatibility tag: `manylinux_2_28`
+- container runtime: `docker` if available, otherwise `podman`
 
 Useful overrides:
 
 ```bash
 TARGET=aarch64-unknown-linux-musl scripts/build-linux-release.sh
 USE_DOCKER=0 PYTHON=python3.12 scripts/build-linux-release.sh
+CONTAINER_RUNTIME=podman scripts/build-linux-release.sh
+WHEEL_COMPATIBILITY=manylinux_2_28 USE_ZIG=1 scripts/build-linux-release.sh
 ```
+
+`--compatibility manylinux_2_28` is always passed by default. If the build host links against a newer glibc and maturin refuses the wheel, install zig support and set `USE_ZIG=1` so maturin can target the requested manylinux baseline.
 
 ## Windows
 

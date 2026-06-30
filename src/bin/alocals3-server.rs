@@ -1,6 +1,7 @@
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
+use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
@@ -16,13 +17,30 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::AsyncWriteExt;
-use tower_http::trace::TraceLayer;
+use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+static HEALTH_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+fn version_info() -> &'static str {
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        "\nauthors: ",
+        env!("CARGO_PKG_AUTHORS")
+    )
+}
+
 #[derive(Parser, Debug)]
-#[command(name = "alocals3-server")]
+#[command(
+    name = "alocals3-server",
+    version = version_info(),
+    author = env!("CARGO_PKG_AUTHORS"),
+    about = "Run the alocals3 Rust S3-compatible local object storage server"
+)]
 struct Args {
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -36,6 +54,8 @@ struct Args {
     database_url: String,
     #[arg(long, env = "ALOCALS3_STORAGE_ROOT", default_value = "./data")]
     storage_root: PathBuf,
+    #[arg(long, env = "ALOCALS3_LOG_LEVEL", default_value = "info")]
+    log_level: String,
 }
 
 #[derive(Clone)]
@@ -140,9 +160,109 @@ impl IntoResponse for ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
+fn init_logging(log_level: &str) -> anyhow::Result<()> {
+    let filter = EnvFilter::try_new(log_level).or_else(|_| EnvFilter::try_new("info"))?;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .try_init()
+        .map_err(|err| anyhow::anyhow!("failed to initialize logging: {err}"))?;
+    Ok(())
+}
+
+fn database_backend(database_url: &str) -> &'static str {
+    if database_url.starts_with("sqlite") {
+        "sqlite"
+    } else if database_url.starts_with("postgresql") || database_url.starts_with("postgres") {
+        "postgresql"
+    } else {
+        "unknown"
+    }
+}
+
+async fn request_logging(request: Request<Body>, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let should_log = path == "/healthz" || path.starts_with("/s3");
+    if !should_log {
+        return next.run(request).await;
+    }
+
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let status = response.status();
+
+    if path == "/healthz" {
+        let hit = HEALTH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let sampled = status.is_client_error() || status.is_server_error() || hit % 30 == 0;
+        if sampled {
+            log_by_status(
+                status,
+                format_args!(
+                    "health method={} status={} duration_ms={:.2} sampled={}",
+                    method,
+                    status.as_u16(),
+                    duration_ms,
+                    sampled
+                ),
+            );
+        }
+        return response;
+    }
+
+    let (bucket, key) = extract_bucket_key(&path);
+    log_by_status(
+        status,
+        format_args!(
+            "s3 method={} status={} duration_ms={:.2} bucket={} key={} path={}",
+            method,
+            status.as_u16(),
+            duration_ms,
+            bucket,
+            key,
+            path
+        ),
+    );
+    response
+}
+
+fn log_by_status(status: StatusCode, args: std::fmt::Arguments<'_>) {
+    if status.is_server_error() {
+        tracing::error!("{args}");
+    } else if status.is_client_error() {
+        tracing::warn!("{args}");
+    } else {
+        tracing::info!("{args}");
+    }
+}
+
+fn extract_bucket_key(path: &str) -> (&str, String) {
+    let parts = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 2 || parts[0] != "s3" {
+        return ("-", "-".to_string());
+    }
+    let bucket = parts[1];
+    if parts.len() == 2 || parts.get(2) == Some(&"objects") {
+        return (bucket, "-".to_string());
+    }
+    (bucket, parts[2..].join("/"))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    init_logging(&args.log_level)?;
+    tracing::info!(
+        host = %args.host,
+        port = args.port,
+        database_backend = database_backend(&args.database_url),
+        storage_root = %args.storage_root.display(),
+        "starting alocals3 server"
+    );
     let storage = Arc::new(Storage::connect(&args.database_url, args.storage_root).await?);
     let app = Router::new()
         .route("/healthz", get(health))
@@ -161,11 +281,12 @@ async fn main() -> anyhow::Result<()> {
                 .head(head_object)
                 .delete(delete_object),
         )
-        .layer(TraceLayer::new_for_http())
+        .layer(from_fn(request_logging))
         .with_state(AppState { storage });
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, "alocals3 server listening");
     axum::serve(listener, app).await?;
     Ok(())
 }

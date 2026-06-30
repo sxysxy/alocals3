@@ -13,6 +13,7 @@
 - `DB_URL` (默认 `sqlite:///<项目绝对路径>/alocals3.db`)
 - `STORAGE_ROOT` (默认 `<项目绝对路径>/data`)
 - `SERVER_BIN` (默认 `<项目绝对路径>/target/release/alocals3-server`，不存在时自动 release 构建)
+- `LOG_LEVEL` (默认 `info`)
 
 ## 2) 客户端基础流程（插入、查询、下载、删除）
 

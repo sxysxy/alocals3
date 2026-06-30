@@ -9,6 +9,7 @@ PORT="${PORT:-8000}"
 DB_URL="${DB_URL:-sqlite:///$ROOT_DIR/alocals3.db}"
 STORAGE_ROOT="${STORAGE_ROOT:-$ROOT_DIR/data}"
 SERVER_BIN="${SERVER_BIN:-$ROOT_DIR/target/release/alocals3-server}"
+LOG_LEVEL="${LOG_LEVEL:-info}"
 
 if [[ ! -x "$SERVER_BIN" ]]; then
   echo "Missing server binary. Building: $SERVER_BIN" >&2
@@ -23,4 +24,5 @@ fi
   --host "$HOST" \
   --port "$PORT" \
   --database-url "$DB_URL" \
-  --storage-root "$STORAGE_ROOT"
+  --storage-root "$STORAGE_ROOT" \
+  --log-level "$LOG_LEVEL"

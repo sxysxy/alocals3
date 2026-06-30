@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "alocals3"
-version = "0.4.0"
+version = "0.5.0"
 description = "alocals3: a Rust S3-like server and Rust-backed Python client"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -32,6 +32,7 @@ alocals3-client = "alocals3.client:main"
 module-name = "alocals3._alocals3_native"
 python-source = "."
 features = ["extension-module"]
+compatibility = "manylinux_2_28"
 include = [
   "alocals3/__init__.py",
   "alocals3/client.py",

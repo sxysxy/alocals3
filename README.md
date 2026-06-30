@@ -107,8 +107,9 @@ python -m alocals3.client --endpoint http://127.0.0.1:8000 \
 ```
 
 ```python
+import asyncio
 from pathlib import Path
-from alocals3.client import LocalS3Client
+from alocals3.client import LocalS3Client, LocalS3ClientAsync
 
 client = LocalS3Client("http://127.0.0.1:8000")
 data, headers = client.get_object_range("demo", "video.bin", "bytes=0-99")
@@ -122,6 +123,16 @@ headers = client.get_object_to_file(
 )
 print(headers.get("content-range"))
 client.close()
+
+# Ignore HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY from the environment.
+client = LocalS3Client("http://127.0.0.1:8000", disable_proxy=True)
+client.close()
+
+async def main():
+    async with LocalS3ClientAsync("http://127.0.0.1:8000", disable_proxy=True) as async_client:
+        print(await async_client.list_buckets())
+
+asyncio.run(main())
 ```
 
 ## Consistency and Atomicity

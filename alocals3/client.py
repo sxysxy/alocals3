@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -12,11 +13,22 @@ except ModuleNotFoundError:  # pragma: no cover - runtime environment dependent
 
 
 class LocalS3Client:
-    def __init__(self, base_url: str = "http://127.0.0.1:8000", timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8000",
+        timeout: float = 10.0,
+        disable_proxy: bool = False,
+    ) -> None:
         if httpx is None:
             raise RuntimeError("httpx is required, run: pip install -r requirements.txt")
         self.base_url = base_url.rstrip("/")
-        self._client = httpx.Client(base_url=self.base_url, timeout=timeout)
+        self._client = httpx.Client(base_url=self.base_url, timeout=timeout, trust_env=not disable_proxy)
+
+    def __enter__(self) -> "LocalS3Client":
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.close()
 
     def health(self) -> dict:
         response = self._client.get("/healthz")
@@ -110,10 +122,127 @@ class LocalS3Client:
         self._client.close()
 
 
+class LocalS3ClientAsync:
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8000",
+        timeout: float = 10.0,
+        disable_proxy: bool = False,
+    ) -> None:
+        if httpx is None:
+            raise RuntimeError("httpx is required, run: pip install -r requirements.txt")
+        self.base_url = base_url.rstrip("/")
+        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout, trust_env=not disable_proxy)
+
+    async def __aenter__(self) -> "LocalS3ClientAsync":
+        return self
+
+    async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        await self.close()
+
+    async def health(self) -> dict:
+        response = await self._client.get("/healthz")
+        response.raise_for_status()
+        return response.json()
+
+    async def list_buckets(self) -> list[dict]:
+        response = await self._client.get("/s3")
+        response.raise_for_status()
+        return response.json()
+
+    async def create_bucket(self, bucket: str) -> dict:
+        response = await self._client.put(f"/s3/{bucket}")
+        response.raise_for_status()
+        return response.json()
+
+    async def delete_bucket(self, bucket: str) -> None:
+        response = await self._client.delete(f"/s3/{bucket}")
+        response.raise_for_status()
+
+    async def list_objects(self, bucket: str, prefix: str | None = None, limit: int = 1000) -> list[dict]:
+        params = {"limit": limit}
+        if prefix:
+            params["prefix"] = prefix
+        response = await self._client.get(f"/s3/{bucket}/objects", params=params)
+        response.raise_for_status()
+        return response.json()
+
+    async def list_objects_v2(
+        self,
+        bucket: str,
+        prefix: str = "",
+        delimiter: str = "",
+        max_keys: int = 1000,
+        continuation_token: str | None = None,
+    ) -> dict:
+        params: dict[str, str | int] = {
+            "list-type": 2,
+            "prefix": prefix,
+            "delimiter": delimiter,
+            "max-keys": max_keys,
+            "output": "json",
+        }
+        if continuation_token:
+            params["continuation-token"] = continuation_token
+        response = await self._client.get(f"/s3/{bucket}", params=params)
+        response.raise_for_status()
+        return response.json()
+
+    async def put_object(self, bucket: str, key: str, file_path: Path, content_type: str | None = None) -> dict:
+        body = await asyncio.to_thread(file_path.read_bytes)
+        headers: dict[str, str] = {}
+        if content_type:
+            headers["content-type"] = content_type
+        response = await self._client.put(f"/s3/{bucket}/{key}", content=body, headers=headers)
+        response.raise_for_status()
+        return response.json()
+
+    async def get_object(self, bucket: str, key: str, output_path: Path) -> None:
+        response = await self._client.get(f"/s3/{bucket}/{key}")
+        response.raise_for_status()
+        await asyncio.to_thread(_write_bytes, output_path, response.content)
+
+    async def get_object_range(self, bucket: str, key: str, range_header: str) -> tuple[bytes, dict]:
+        response = await self._client.get(f"/s3/{bucket}/{key}", headers={"range": range_header})
+        response.raise_for_status()
+        return response.content, dict(response.headers)
+
+    async def get_object_to_file(
+        self,
+        bucket: str,
+        key: str,
+        output_path: Path,
+        range_header: str | None = None,
+    ) -> dict:
+        headers: dict[str, str] = {}
+        if range_header:
+            headers["range"] = range_header
+        response = await self._client.get(f"/s3/{bucket}/{key}", headers=headers)
+        response.raise_for_status()
+        await asyncio.to_thread(_write_bytes, output_path, response.content)
+        return dict(response.headers)
+
+    async def delete_object(self, bucket: str, key: str) -> None:
+        response = await self._client.delete(f"/s3/{bucket}/{key}")
+        response.raise_for_status()
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def aclose(self) -> None:
+        await self.close()
+
+
+def _write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Simple CLI client for alocals3 server")
     parser.add_argument("--endpoint", default="http://127.0.0.1:8000", help="Server endpoint")
     parser.add_argument("--timeout", type=float, default=10.0, help="HTTP timeout seconds")
+    parser.add_argument("--disable-proxy", action="store_true", help="Ignore proxy environment variables")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -161,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
-        client = LocalS3Client(base_url=args.endpoint, timeout=args.timeout)
+        client = LocalS3Client(base_url=args.endpoint, timeout=args.timeout, disable_proxy=args.disable_proxy)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1

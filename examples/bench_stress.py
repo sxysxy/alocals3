@@ -8,6 +8,7 @@ import random
 import string
 import time
 from collections import Counter
+from urllib.parse import quote
 
 import httpx
 
@@ -22,15 +23,25 @@ def _rand_body(size: int) -> bytes:
     return "".join(random.choice(chars) for _ in range(size)).encode("utf-8")
 
 
+def _bucket_path(bucket: str) -> str:
+    return f"/s3/{quote(bucket, safe='', encoding='utf-8', errors='strict')}"
+
+
+def _object_path(bucket: str, key: str) -> str:
+    encoded_key = quote(key, safe="/", encoding="utf-8", errors="strict")
+    return f"{_bucket_path(bucket)}/{encoded_key}"
+
+
 async def run(args: argparse.Namespace) -> int:
     endpoint = args.endpoint.rstrip("/")
+    bucket_path = _bucket_path(args.bucket)
     stop_at = time.monotonic() + args.duration
     counters: Counter[str] = Counter()
     latencies_ms: list[float] = []
     lat_lock = asyncio.Lock()
 
     async with httpx.AsyncClient(base_url=endpoint, timeout=args.timeout) as client:
-        r = await client.put(f"/s3/{args.bucket}")
+        r = await client.put(bucket_path)
         if r.status_code not in (201, 409):
             print(f"failed to ensure bucket, status={r.status_code}, body={r.text}")
             return 2
@@ -45,7 +56,7 @@ async def run(args: argparse.Namespace) -> int:
                 if op_put:
                     body = _rand_body(args.object_size)
                     resp = await client.put(
-                        f"/s3/{args.bucket}/{key}",
+                        _object_path(args.bucket, key),
                         content=body,
                         headers={"content-type": "application/octet-stream"},
                     )
@@ -56,7 +67,7 @@ async def run(args: argparse.Namespace) -> int:
                     else:
                         local_counts[f"put_{resp.status_code}"] += 1
                 else:
-                    resp = await client.get(f"/s3/{args.bucket}/{key}")
+                    resp = await client.get(_object_path(args.bucket, key))
                     dt = (time.perf_counter() - t0) * 1000
                     local_lats.append(dt)
                     if resp.status_code == 200:

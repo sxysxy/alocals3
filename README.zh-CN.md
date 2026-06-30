@@ -52,6 +52,8 @@ python -m alocals3.server --log-level WARNING
 - `HEAD /s3/{bucket}/{key}`: 只取元信息（支持 `304`，支持 `Range` 返回 `206/416`）
 - `DELETE /s3/{bucket}/{key}`: 删除对象
 
+Bucket 名称、对象 key、prefix、delimiter、continuation token 都按 UTF-8 文本处理。客户端会自动对路径参数做 UTF-8 percent-encoding；调用时传 `logs/数据.txt` 这样的原始字符串，不要传已经 URL 编码过的片段。
+
 ## 条件 PUT 与完整性校验
 
 `PUT /s3/{bucket}/{key}` 支持：

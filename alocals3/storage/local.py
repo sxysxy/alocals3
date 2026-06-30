@@ -63,13 +63,14 @@ class LocalStorageBackend:
 
     def list_objects(self, bucket: str, prefix: str | None = None, limit: int = 1000) -> list[ObjectInfo]:
         self._validate_bucket(bucket)
+        normalized_prefix = _ensure_utf8_text(prefix, "prefix") if prefix is not None else None
 
         with self.session_factory() as session:
             bucket_row = self._get_bucket_or_404(session, bucket)
 
             stmt = select(ObjectModel).where(ObjectModel.bucket_id == bucket_row.id)
-            if prefix:
-                stmt = stmt.where(ObjectModel.key.startswith(prefix))
+            if normalized_prefix:
+                stmt = stmt.where(ObjectModel.key.startswith(normalized_prefix))
             stmt = stmt.order_by(ObjectModel.key.asc()).limit(limit)
 
             rows = session.scalars(stmt).all()
@@ -84,6 +85,10 @@ class LocalStorageBackend:
         continuation_token: str | None = None,
     ) -> dict:
         self._validate_bucket(bucket)
+        prefix = _ensure_utf8_text(prefix, "prefix")
+        delimiter = _ensure_utf8_text(delimiter, "delimiter")
+        if continuation_token is not None:
+            continuation_token = _ensure_utf8_text(continuation_token, "continuation_token")
         if max_keys < 1:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="max_keys must be >= 1")
 
@@ -150,7 +155,11 @@ class LocalStorageBackend:
         self._validate_bucket(bucket)
         normalized_key = self._normalize_key(key)
         now = datetime.now(tz=timezone.utc)
-        final_content_type = content_type or mimetypes.guess_type(normalized_key)[0] or "application/octet-stream"
+        final_content_type = (
+            _ensure_utf8_text(content_type, "content_type")
+            if content_type
+            else mimetypes.guess_type(normalized_key)[0] or "application/octet-stream"
+        )
 
         with self.session_factory() as session:
             bucket_row = self._get_bucket_or_404(session, bucket)
@@ -287,6 +296,7 @@ class LocalStorageBackend:
         )
 
     def _validate_bucket(self, bucket: str) -> None:
+        bucket = _ensure_utf8_text(bucket, "bucket")
         if not bucket or "/" in bucket or "\\" in bucket or bucket in {".", ".."}:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -294,7 +304,7 @@ class LocalStorageBackend:
             )
 
     def _normalize_key(self, key: str) -> str:
-        normalized = key.strip("/")
+        normalized = _ensure_utf8_text(key, "key").strip("/")
         if not normalized:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid object key")
         if normalized.startswith("../") or "/../" in normalized or normalized == "..":
@@ -346,3 +356,14 @@ def _to_utc(dt: datetime) -> datetime:
 def _is_locked_error(exc: OperationalError) -> bool:
     text = str(exc).lower()
     return "database is locked" in text or "database table is locked" in text
+
+
+def _ensure_utf8_text(value: str, field_name: str) -> str:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{field_name} must be valid UTF-8 text",
+        ) from exc
+    return value

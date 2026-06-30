@@ -5,6 +5,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 try:
     import httpx
@@ -21,7 +22,7 @@ class LocalS3Client:
     ) -> None:
         if httpx is None:
             raise RuntimeError("httpx is required, run: pip install -r requirements.txt")
-        self.base_url = base_url.rstrip("/")
+        self.base_url = _ensure_utf8_text(base_url, "base_url").rstrip("/")
         self._client = httpx.Client(base_url=self.base_url, timeout=timeout, trust_env=not disable_proxy)
 
     def __enter__(self) -> "LocalS3Client":
@@ -41,19 +42,19 @@ class LocalS3Client:
         return response.json()
 
     def create_bucket(self, bucket: str) -> dict:
-        response = self._client.put(f"/s3/{bucket}")
+        response = self._client.put(_bucket_path(bucket))
         response.raise_for_status()
         return response.json()
 
     def delete_bucket(self, bucket: str) -> None:
-        response = self._client.delete(f"/s3/{bucket}")
+        response = self._client.delete(_bucket_path(bucket))
         response.raise_for_status()
 
     def list_objects(self, bucket: str, prefix: str | None = None, limit: int = 1000) -> list[dict]:
         params = {"limit": limit}
         if prefix:
-            params["prefix"] = prefix
-        response = self._client.get(f"/s3/{bucket}/objects", params=params)
+            params["prefix"] = _ensure_utf8_text(prefix, "prefix")
+        response = self._client.get(f"{_bucket_path(bucket)}/objects", params=params)
         response.raise_for_status()
         return response.json()
 
@@ -67,14 +68,14 @@ class LocalS3Client:
     ) -> dict:
         params: dict[str, str | int] = {
             "list-type": 2,
-            "prefix": prefix,
-            "delimiter": delimiter,
+            "prefix": _ensure_utf8_text(prefix, "prefix"),
+            "delimiter": _ensure_utf8_text(delimiter, "delimiter"),
             "max-keys": max_keys,
             "output": "json",
         }
         if continuation_token:
-            params["continuation-token"] = continuation_token
-        response = self._client.get(f"/s3/{bucket}", params=params)
+            params["continuation-token"] = _ensure_utf8_text(continuation_token, "continuation_token")
+        response = self._client.get(_bucket_path(bucket), params=params)
         response.raise_for_status()
         return response.json()
 
@@ -82,19 +83,22 @@ class LocalS3Client:
         body = file_path.read_bytes()
         headers: dict[str, str] = {}
         if content_type:
-            headers["content-type"] = content_type
-        response = self._client.put(f"/s3/{bucket}/{key}", content=body, headers=headers)
+            headers["content-type"] = _ensure_utf8_text(content_type, "content_type")
+        response = self._client.put(_object_path(bucket, key), content=body, headers=headers)
         response.raise_for_status()
         return response.json()
 
     def get_object(self, bucket: str, key: str, output_path: Path) -> None:
-        response = self._client.get(f"/s3/{bucket}/{key}")
+        response = self._client.get(_object_path(bucket, key))
         response.raise_for_status()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(response.content)
 
     def get_object_range(self, bucket: str, key: str, range_header: str) -> tuple[bytes, dict]:
-        response = self._client.get(f"/s3/{bucket}/{key}", headers={"range": range_header})
+        response = self._client.get(
+            _object_path(bucket, key),
+            headers={"range": _ensure_utf8_text(range_header, "range_header")},
+        )
         response.raise_for_status()
         return response.content, dict(response.headers)
 
@@ -107,15 +111,15 @@ class LocalS3Client:
     ) -> dict:
         headers: dict[str, str] = {}
         if range_header:
-            headers["range"] = range_header
-        response = self._client.get(f"/s3/{bucket}/{key}", headers=headers)
+            headers["range"] = _ensure_utf8_text(range_header, "range_header")
+        response = self._client.get(_object_path(bucket, key), headers=headers)
         response.raise_for_status()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(response.content)
         return dict(response.headers)
 
     def delete_object(self, bucket: str, key: str) -> None:
-        response = self._client.delete(f"/s3/{bucket}/{key}")
+        response = self._client.delete(_object_path(bucket, key))
         response.raise_for_status()
 
     def close(self) -> None:
@@ -131,7 +135,7 @@ class LocalS3ClientAsync:
     ) -> None:
         if httpx is None:
             raise RuntimeError("httpx is required, run: pip install -r requirements.txt")
-        self.base_url = base_url.rstrip("/")
+        self.base_url = _ensure_utf8_text(base_url, "base_url").rstrip("/")
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout, trust_env=not disable_proxy)
 
     async def __aenter__(self) -> "LocalS3ClientAsync":
@@ -151,19 +155,19 @@ class LocalS3ClientAsync:
         return response.json()
 
     async def create_bucket(self, bucket: str) -> dict:
-        response = await self._client.put(f"/s3/{bucket}")
+        response = await self._client.put(_bucket_path(bucket))
         response.raise_for_status()
         return response.json()
 
     async def delete_bucket(self, bucket: str) -> None:
-        response = await self._client.delete(f"/s3/{bucket}")
+        response = await self._client.delete(_bucket_path(bucket))
         response.raise_for_status()
 
     async def list_objects(self, bucket: str, prefix: str | None = None, limit: int = 1000) -> list[dict]:
         params = {"limit": limit}
         if prefix:
-            params["prefix"] = prefix
-        response = await self._client.get(f"/s3/{bucket}/objects", params=params)
+            params["prefix"] = _ensure_utf8_text(prefix, "prefix")
+        response = await self._client.get(f"{_bucket_path(bucket)}/objects", params=params)
         response.raise_for_status()
         return response.json()
 
@@ -177,14 +181,14 @@ class LocalS3ClientAsync:
     ) -> dict:
         params: dict[str, str | int] = {
             "list-type": 2,
-            "prefix": prefix,
-            "delimiter": delimiter,
+            "prefix": _ensure_utf8_text(prefix, "prefix"),
+            "delimiter": _ensure_utf8_text(delimiter, "delimiter"),
             "max-keys": max_keys,
             "output": "json",
         }
         if continuation_token:
-            params["continuation-token"] = continuation_token
-        response = await self._client.get(f"/s3/{bucket}", params=params)
+            params["continuation-token"] = _ensure_utf8_text(continuation_token, "continuation_token")
+        response = await self._client.get(_bucket_path(bucket), params=params)
         response.raise_for_status()
         return response.json()
 
@@ -192,18 +196,21 @@ class LocalS3ClientAsync:
         body = await asyncio.to_thread(file_path.read_bytes)
         headers: dict[str, str] = {}
         if content_type:
-            headers["content-type"] = content_type
-        response = await self._client.put(f"/s3/{bucket}/{key}", content=body, headers=headers)
+            headers["content-type"] = _ensure_utf8_text(content_type, "content_type")
+        response = await self._client.put(_object_path(bucket, key), content=body, headers=headers)
         response.raise_for_status()
         return response.json()
 
     async def get_object(self, bucket: str, key: str, output_path: Path) -> None:
-        response = await self._client.get(f"/s3/{bucket}/{key}")
+        response = await self._client.get(_object_path(bucket, key))
         response.raise_for_status()
         await asyncio.to_thread(_write_bytes, output_path, response.content)
 
     async def get_object_range(self, bucket: str, key: str, range_header: str) -> tuple[bytes, dict]:
-        response = await self._client.get(f"/s3/{bucket}/{key}", headers={"range": range_header})
+        response = await self._client.get(
+            _object_path(bucket, key),
+            headers={"range": _ensure_utf8_text(range_header, "range_header")},
+        )
         response.raise_for_status()
         return response.content, dict(response.headers)
 
@@ -216,14 +223,14 @@ class LocalS3ClientAsync:
     ) -> dict:
         headers: dict[str, str] = {}
         if range_header:
-            headers["range"] = range_header
-        response = await self._client.get(f"/s3/{bucket}/{key}", headers=headers)
+            headers["range"] = _ensure_utf8_text(range_header, "range_header")
+        response = await self._client.get(_object_path(bucket, key), headers=headers)
         response.raise_for_status()
         await asyncio.to_thread(_write_bytes, output_path, response.content)
         return dict(response.headers)
 
     async def delete_object(self, bucket: str, key: str) -> None:
-        response = await self._client.delete(f"/s3/{bucket}/{key}")
+        response = await self._client.delete(_object_path(bucket, key))
         response.raise_for_status()
 
     async def close(self) -> None:
@@ -236,6 +243,30 @@ class LocalS3ClientAsync:
 def _write_bytes(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
+
+
+def _bucket_path(bucket: str) -> str:
+    return f"/s3/{_quote_path_segment(bucket, 'bucket')}"
+
+
+def _object_path(bucket: str, key: str) -> str:
+    return f"{_bucket_path(bucket)}/{_quote_key_path(key)}"
+
+
+def _quote_path_segment(value: str, field_name: str) -> str:
+    return quote(_ensure_utf8_text(value, field_name), safe="", encoding="utf-8", errors="strict")
+
+
+def _quote_key_path(key: str) -> str:
+    return quote(_ensure_utf8_text(key, "key"), safe="/", encoding="utf-8", errors="strict")
+
+
+def _ensure_utf8_text(value: str, field_name: str) -> str:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{field_name} must be valid UTF-8 text") from exc
+    return value
 
 
 def _build_parser() -> argparse.ArgumentParser:

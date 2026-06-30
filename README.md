@@ -54,6 +54,8 @@ For production workloads, PostgreSQL is strongly recommended.
 - `HEAD /s3/{bucket}/{key}`: metadata only (supports `304`, `Range` => `206/416`)
 - `DELETE /s3/{bucket}/{key}`: delete object
 
+Bucket names, object keys, prefixes, delimiters, and continuation tokens are treated as UTF-8 text. Client path parameters are UTF-8 percent-encoded automatically; pass raw strings such as `logs/数据.txt`, not pre-encoded URL fragments.
+
 ## Conditional PUT and Integrity
 
 `PUT /s3/{bucket}/{key}` supports:

@@ -8,6 +8,7 @@ import string
 import threading
 import time
 from collections import Counter
+from urllib.parse import quote
 
 import httpx
 
@@ -38,10 +39,21 @@ def validate_payload(data: bytes) -> bool:
     return expected == actual
 
 
+def _bucket_path(bucket: str) -> str:
+    return f"/s3/{quote(bucket, safe='', encoding='utf-8', errors='strict')}"
+
+
+def _object_path(bucket: str, key: str) -> str:
+    encoded_key = quote(key, safe="/", encoding="utf-8", errors="strict")
+    return f"{_bucket_path(bucket)}/{encoded_key}"
+
+
 def run(args: argparse.Namespace) -> int:
     endpoint = args.endpoint.rstrip("/")
     bucket = args.bucket
     key = args.key
+    bucket_path = _bucket_path(bucket)
+    object_path = _object_path(bucket, key)
 
     counts: Counter[str] = Counter()
     lock = threading.Lock()
@@ -49,7 +61,7 @@ def run(args: argparse.Namespace) -> int:
 
     client = httpx.Client(base_url=endpoint, timeout=args.timeout)
     try:
-        r = client.put(f"/s3/{bucket}")
+        r = client.put(bucket_path)
         if r.status_code not in (201, 409):
             print(f"failed to ensure bucket, status={r.status_code}, body={r.text}")
             return 2
@@ -62,7 +74,7 @@ def run(args: argparse.Namespace) -> int:
                 payload = build_payload(seq=(worker_id * 10_000_000 + seq), blob_size=args.payload_size)
                 try:
                     resp = client.put(
-                        f"/s3/{bucket}/{key}",
+                        object_path,
                         content=payload,
                         headers={"content-type": "application/octet-stream"},
                     )
@@ -84,7 +96,7 @@ def run(args: argparse.Namespace) -> int:
             local = Counter()
             while time.time() < stop_at:
                 try:
-                    resp = client.get(f"/s3/{bucket}/{key}")
+                    resp = client.get(object_path)
                     if resp.status_code == 200:
                         etag = resp.headers.get("etag", "").strip('"')
                         md5 = hashlib.md5(resp.content, usedforsecurity=False).hexdigest()
@@ -108,7 +120,7 @@ def run(args: argparse.Namespace) -> int:
             local = Counter()
             while time.time() < stop_at:
                 try:
-                    resp = client.delete(f"/s3/{bucket}/{key}")
+                    resp = client.delete(object_path)
                     if resp.status_code == 204:
                         local["del_ok"] += 1
                     elif resp.status_code == 404:

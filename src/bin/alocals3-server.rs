@@ -1,5 +1,5 @@
 use axum::body::{Body, Bytes};
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Response};
@@ -56,6 +56,8 @@ struct Args {
     storage_root: PathBuf,
     #[arg(long, env = "ALOCALS3_LOG_LEVEL", default_value = "info")]
     log_level: String,
+    #[arg(long, env = "ALOCALS3_MAX_UPLOAD_SIZE", default_value_t = 0)]
+    max_upload_size: usize,
 }
 
 #[derive(Clone)]
@@ -261,9 +263,15 @@ async fn main() -> anyhow::Result<()> {
         port = args.port,
         database_backend = database_backend(&args.database_url),
         storage_root = %args.storage_root.display(),
+        max_upload_size = args.max_upload_size,
         "starting alocals3 server"
     );
     let storage = Arc::new(Storage::connect(&args.database_url, args.storage_root).await?);
+    let body_limit = if args.max_upload_size == 0 {
+        DefaultBodyLimit::disable()
+    } else {
+        DefaultBodyLimit::max(args.max_upload_size)
+    };
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/s3", get(list_buckets))
@@ -281,6 +289,7 @@ async fn main() -> anyhow::Result<()> {
                 .head(head_object)
                 .delete(delete_object),
         )
+        .layer(body_limit)
         .layer(from_fn(request_logging))
         .with_state(AppState { storage });
 

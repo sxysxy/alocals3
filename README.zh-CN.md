@@ -75,6 +75,7 @@ Server CLI 参数：
 - `--database-url`：SQLite 或 PostgreSQL 连接串
 - `--storage-root`：对象内容落盘目录
 - `--log-level`：日志级别或 `tracing_subscriber` 过滤 directive，默认 `info`
+- `--max-upload-size`：上传 body 最大字节数，默认 `0` 表示禁用 axum body 限制
 - `--version`：输出 server 版本号和作者信息
 
 环境变量：
@@ -82,6 +83,7 @@ Server CLI 参数：
 - `ALOCALS3_DATABASE_URL`：默认 `sqlite:///./alocals3.db`
 - `ALOCALS3_STORAGE_ROOT`：默认 `./data`
 - `ALOCALS3_LOG_LEVEL`：默认 `info`
+- `ALOCALS3_MAX_UPLOAD_SIZE`：默认 `0`
 
 连接串示例：
 
@@ -91,6 +93,8 @@ Server CLI 参数：
 脚本和服务里建议给 SQLite 使用绝对路径，避免因为工作目录不同写到不同数据库。持续并发写入场景建议使用 PostgreSQL。
 
 日志输出到 stderr。常用级别包括 `debug`、`info`、`warn`、`error`；也支持完整 `EnvFilter` directive，例如 `warn,alocals3_server=debug`。
+
+默认情况下，server 不再使用 axum 的 body extractor 上传大小限制。当前实现会先把每个上传对象整体读入内存再写入磁盘，所以实际可上传大小仍受进程内存和可用磁盘限制。如果需要显式限制上传大小，可以设置 `--max-upload-size`。
 
 ## 存储布局
 

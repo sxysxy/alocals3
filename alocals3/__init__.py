@@ -1,4 +1,4 @@
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 __all__ = ["LocalS3Client", "LocalS3ClientAsync", "__version__"]
 

@@ -77,6 +77,7 @@ Server CLI flags:
 - `--database-url`: SQLite or PostgreSQL URL
 - `--storage-root`: object payload root directory
 - `--log-level`: log level or `tracing_subscriber` filter directive, default `info`
+- `--max-upload-size`: maximum upload body size in bytes, default `0` disables the axum body limit
 - `--version`: print server version and author information
 
 Environment variables:
@@ -84,6 +85,7 @@ Environment variables:
 - `ALOCALS3_DATABASE_URL`: default `sqlite:///./alocals3.db`
 - `ALOCALS3_STORAGE_ROOT`: default `./data`
 - `ALOCALS3_LOG_LEVEL`: default `info`
+- `ALOCALS3_MAX_UPLOAD_SIZE`: default `0`
 
 Database URL examples:
 
@@ -93,6 +95,8 @@ Database URL examples:
 Use an absolute SQLite path in scripts and services to avoid accidentally writing to different database files from different working directories. PostgreSQL is recommended for sustained concurrent workloads.
 
 Logging is written to stderr. Common levels are `debug`, `info`, `warn`, and `error`; full `EnvFilter` directives such as `warn,alocals3_server=debug` are also accepted.
+
+Uploads are not capped by the server body extractor by default. The current implementation buffers each uploaded object in memory before writing it to disk, so practical limits are still determined by process memory and available storage. Set `--max-upload-size` to restore an explicit byte limit.
 
 ## Storage Layout
 

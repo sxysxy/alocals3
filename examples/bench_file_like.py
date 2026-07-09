@@ -13,7 +13,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from alocals3.client import LocalS3Client
+from alocals3.client import ALocalS3Client
 
 
 def _mib(value: int) -> int:
@@ -33,7 +33,7 @@ def _make_chunk(size: int, seed: str) -> bytes:
     return bytes(out[:size])
 
 
-def _ensure_bucket(client: LocalS3Client, bucket: str) -> None:
+def _ensure_bucket(client: ALocalS3Client, bucket: str) -> None:
     try:
         client.create_bucket(bucket)
     except RuntimeError as exc:
@@ -42,7 +42,7 @@ def _ensure_bucket(client: LocalS3Client, bucket: str) -> None:
 
 
 def _write_object(
-    client: LocalS3Client,
+    client: ALocalS3Client,
     url: str,
     *,
     total_size: int,
@@ -64,7 +64,7 @@ def _write_object(
 
 
 def _read_object(
-    client: LocalS3Client,
+    client: ALocalS3Client,
     url: str,
     *,
     chunk_size: int,
@@ -95,7 +95,7 @@ def _print_result(record: dict[str, Any]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark LocalS3Client file-like open() read/write throughput")
+    parser = argparse.ArgumentParser(description="Benchmark ALocalS3Client file-like open() read/write throughput")
     parser.add_argument("--endpoint", default="http://127.0.0.1:8000")
     parser.add_argument("--bucket", default="bench-file-like")
     parser.add_argument("--key", default="large/file-like.bin")
@@ -124,7 +124,7 @@ def main() -> int:
     chunk = _make_chunk(chunk_size, args.seed)
     url = _object_url(args.bucket, args.key)
 
-    with LocalS3Client(args.endpoint, timeout=args.timeout, disable_proxy=args.disable_proxy) as client:
+    with ALocalS3Client(args.endpoint, timeout=args.timeout, disable_proxy=args.disable_proxy) as client:
         _ensure_bucket(client, args.bucket)
         _print_result(
             {

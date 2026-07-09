@@ -169,9 +169,9 @@ The Python runtime dependency list is intentionally empty. HTTP networking is im
 import asyncio
 from pathlib import Path
 
-from alocals3.client import LocalS3Client, LocalS3ClientAsync
+from alocals3.client import ALocalS3Client, ALocalS3ClientAsync
 
-with LocalS3Client("http://127.0.0.1:8000", disable_proxy=True) as client:
+with ALocalS3Client("http://127.0.0.1:8000", disable_proxy=True) as client:
     client.create_bucket("demo")
     info = client.put_object("demo", "logs/数据.txt", Path("data.txt"))
     print(info["etag"])
@@ -189,8 +189,12 @@ with LocalS3Client("http://127.0.0.1:8000", disable_proxy=True) as client:
 
 
 async def main() -> None:
-    async with LocalS3ClientAsync("http://127.0.0.1:8000", disable_proxy=True) as client:
+    async with ALocalS3ClientAsync("http://127.0.0.1:8000", disable_proxy=True) as client:
         print(await client.list_buckets())
+        async with client.open("s3://demo/logs/from-async-open.txt", "wb") as f:
+            await f.write(b"hello from async file-like API\n")
+        async with client.open("s3://demo/logs/from-async-open.txt", "rb") as f:
+            print(await f.read())
 
 
 asyncio.run(main())
@@ -212,6 +216,7 @@ Set `disable_proxy=True` or pass `--disable-proxy` to ignore proxy environment v
 - Read modes (`"rb"` / `"r"`) create a Rust-backed streaming HTTP reader. `open()` sends the request and reads response headers, but object bytes are pulled from the network when the returned file object's `read()` path runs.
 - Write modes (`"wb"` / `"w"`) spool writes to a Rust-owned temporary file. The HTTP `PUT` is sent when the file is closed or the `with` block exits successfully. If the `with` block exits with an exception, the upload is discarded.
 - `cache_path=` is best-effort and is populated as bytes pass through the file-like object; cache write failures do not fail the network operation.
+- For asyncio code, `ALocalS3ClientAsync.open()` returns an async file-like object for `async with`. It provides awaitable `read()`, `readline()`, `readinto()`, `write()`, `flush()`, `close()`, and `discard()` methods backed by the same Rust implementation.
 
 Benchmark the Python file-like API with a large object:
 

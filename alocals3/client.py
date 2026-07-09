@@ -11,7 +11,7 @@ from urllib.parse import unquote, urlparse
 
 from alocals3._alocals3_native import RustHttpClient
 
-class LocalS3Client:
+class ALocalS3Client:
     def __init__(
         self,
         base_url: str = "http://127.0.0.1:8000",
@@ -22,7 +22,7 @@ class LocalS3Client:
             raise RuntimeError("alocals3._alocals3_native is required; install with: pip install -e .")
         self._client = RustHttpClient(base_url, timeout, disable_proxy)
 
-    def __enter__(self) -> "LocalS3Client":
+    def __enter__(self) -> "ALocalS3Client":
         return self
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
@@ -143,16 +143,16 @@ class LocalS3Client:
         return None
 
 
-class LocalS3ClientAsync:
+class ALocalS3ClientAsync:
     def __init__(
         self,
         base_url: str = "http://127.0.0.1:8000",
         timeout: float = 10.0,
         disable_proxy: bool = False,
     ) -> None:
-        self._sync = LocalS3Client(base_url=base_url, timeout=timeout, disable_proxy=disable_proxy)
+        self._sync = ALocalS3Client(base_url=base_url, timeout=timeout, disable_proxy=disable_proxy)
 
-    async def __aenter__(self) -> "LocalS3ClientAsync":
+    async def __aenter__(self) -> "ALocalS3ClientAsync":
         return self
 
     async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
@@ -223,7 +223,7 @@ class LocalS3ClientAsync:
     async def delete_object(self, bucket: str, key: str) -> None:
         await asyncio.to_thread(self._sync.delete_object, bucket, key)
 
-    async def open(
+    def open(
         self,
         url: str,
         mode: str = "rb",
@@ -235,8 +235,8 @@ class LocalS3ClientAsync:
         cache_path: str | Path | None = None,
         range_header: str | None = None,
     ):
-        return await asyncio.to_thread(
-            self._sync.open,
+        return _AsyncS3OpenContext(
+            self._sync,
             url,
             mode,
             encoding=encoding,
@@ -300,6 +300,19 @@ class _S3StreamingRawReader(io.RawIOBase):
     def readinto(self, buffer) -> int:
         if self.closed:
             raise ValueError("I/O operation on closed S3 reader")
+        native_readinto = getattr(self._native_reader, "readinto", None)
+        if native_readinto is not None:
+            try:
+                n = native_readinto(buffer)
+            except (BufferError, TypeError, ValueError):
+                n = None
+            else:
+                if n and self._cache is not None:
+                    try:
+                        self._cache.write(memoryview(buffer)[:n])
+                    except OSError:
+                        self._close_cache()
+                return n
         data = self._native_reader.read(len(buffer))
         if not data:
             return 0
@@ -465,10 +478,158 @@ class _S3StreamingTextWriter:
         self.result = self._binary.result
 
 
+class _AsyncS3OpenContext:
+    def __init__(
+        self,
+        client: ALocalS3Client,
+        url: str,
+        mode: str,
+        *,
+        encoding: str,
+        errors: str | None,
+        newline: str | None,
+        content_type: str | None,
+        cache_path: str | Path | None,
+        range_header: str | None,
+    ) -> None:
+        self._client = client
+        self._url = url
+        self._mode = mode
+        self._encoding = encoding
+        self._errors = errors
+        self._newline = newline
+        self._content_type = content_type
+        self._cache_path = cache_path
+        self._range_header = range_header
+        self._file: _AsyncS3File | None = None
+
+    def __await__(self):
+        return self._open().__await__()
+
+    async def __aenter__(self):
+        self._file = await self._open()
+        return self._file
+
+    async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        if self._file is not None:
+            await self._file.__aexit__(exc_type, exc_value, traceback)
+            self._file = None
+
+    async def _open(self):
+        file_obj = await asyncio.to_thread(
+            self._client.open,
+            self._url,
+            self._mode,
+            encoding=self._encoding,
+            errors=self._errors,
+            newline=self._newline,
+            content_type=self._content_type,
+            cache_path=self._cache_path,
+            range_header=self._range_header,
+        )
+        return _AsyncS3File(file_obj)
+
+
+class _AsyncS3File:
+    def __init__(self, file_obj) -> None:
+        self._file = file_obj
+        self._lock = asyncio.Lock()
+
+    @property
+    def headers(self):
+        return getattr(self._file, "headers", None)
+
+    @property
+    def bucket(self):
+        return getattr(self._file, "bucket", None)
+
+    @property
+    def key(self):
+        return getattr(self._file, "key", None)
+
+    @property
+    def result(self):
+        return getattr(self._file, "result", None)
+
+    @property
+    def closed(self) -> bool:
+        return bool(getattr(self._file, "closed", False))
+
+    def __getattr__(self, name: str):
+        return getattr(self._file, name)
+
+    def readable(self) -> bool:
+        readable = getattr(self._file, "readable", None)
+        return bool(readable()) if readable is not None else False
+
+    def writable(self) -> bool:
+        writable = getattr(self._file, "writable", None)
+        return bool(writable()) if writable is not None else False
+
+    async def read(self, size: int = -1):
+        return await self._call("read", size)
+
+    async def read1(self, size: int = -1):
+        if not hasattr(self._file, "read1"):
+            return await self.read(size)
+        return await self._call("read1", size)
+
+    async def readline(self, size: int = -1):
+        return await self._call("readline", size)
+
+    async def readlines(self, hint: int = -1):
+        return await self._call("readlines", hint)
+
+    async def readinto(self, buffer) -> int:
+        return await self._call("readinto", buffer)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        line = await self.readline()
+        if not line:
+            raise StopAsyncIteration
+        return line
+
+    async def write(self, data) -> int:
+        return await self._call("write", data)
+
+    async def flush(self) -> None:
+        await self._call("flush")
+
+    async def close(self) -> None:
+        await self._call("close")
+
+    async def discard(self) -> None:
+        discard = getattr(self._file, "discard", None)
+        if discard is None:
+            await self.close()
+            return
+        async with self._lock:
+            await asyncio.to_thread(discard)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        exit_func = getattr(self._file, "__exit__", None)
+        if exit_func is None:
+            await self.close()
+            return
+        async with self._lock:
+            await asyncio.to_thread(exit_func, exc_type, exc_value, traceback)
+
+    async def _call(self, method_name: str, *args):
+        method = getattr(self._file, method_name)
+        async with self._lock:
+            return await asyncio.to_thread(method, *args)
+
+
 class _S3BytesWriter(io.BytesIO):
     def __init__(
         self,
-        client: LocalS3Client,
+        client: ALocalS3Client,
         bucket: str,
         key: str,
         *,
@@ -510,7 +671,7 @@ class _S3BytesWriter(io.BytesIO):
 class _S3TextWriter(io.StringIO):
     def __init__(
         self,
-        client: LocalS3Client,
+        client: ALocalS3Client,
         bucket: str,
         key: str,
         *,
@@ -672,7 +833,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    client = LocalS3Client(base_url=args.endpoint, timeout=args.timeout, disable_proxy=args.disable_proxy)
+    client = ALocalS3Client(base_url=args.endpoint, timeout=args.timeout, disable_proxy=args.disable_proxy)
     command = {
         "health": "HEALTH",
         "lsb": "LIST_BUCKETS",

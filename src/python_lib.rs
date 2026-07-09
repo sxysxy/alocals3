@@ -358,6 +358,39 @@ impl RustObjectReader {
         self.closed = true;
     }
 
+    fn readinto(&mut self, py: Python<'_>, buffer: &Bound<'_, PyAny>) -> PyResult<usize> {
+        if self.closed {
+            return Err(PyRuntimeError::new_err("I/O operation on closed S3 reader"));
+        }
+        let Some(response) = self.response.as_mut() else {
+            return Ok(0);
+        };
+
+        let mut view = std::mem::MaybeUninit::<pyo3::ffi::Py_buffer>::uninit();
+        let rc = unsafe {
+            pyo3::ffi::PyObject_GetBuffer(
+                buffer.as_ptr(),
+                view.as_mut_ptr(),
+                pyo3::ffi::PyBUF_WRITABLE | pyo3::ffi::PyBUF_C_CONTIGUOUS,
+            )
+        };
+        if rc != 0 {
+            return Err(PyErr::fetch(py));
+        }
+
+        let mut view = unsafe { view.assume_init() };
+        let result = if view.len <= 0 || view.buf.is_null() {
+            Ok(0)
+        } else {
+            let dst = unsafe { std::slice::from_raw_parts_mut(view.buf.cast::<u8>(), view.len as usize) };
+            py.allow_threads(|| response.read(dst)).map_err(io_error)
+        };
+        unsafe {
+            pyo3::ffi::PyBuffer_Release(&mut view);
+        }
+        result
+    }
+
     fn headers(&self, py: Python<'_>) -> PyResult<PyObject> {
         headers_to_dict(py, &self.headers)
     }

@@ -112,7 +112,7 @@ remaining_objects: grace=1 disable_flag=1 interval_zero=1 race=30
 ./examples/benchmark_file_like.sh
 ```
 
-该脚本使用 `LocalS3Client.open(url, "wb")` 写入大文件，再用 `LocalS3Client.open(url, "rb")` 流式读取并校验 SHA-256。它用于验证 Python file-like API 的吞吐和大文件低内存路径。
+该脚本使用 `ALocalS3Client.open(url, "wb")` 写入大文件，再用 `ALocalS3Client.open(url, "rb")` 流式读取并校验 SHA-256。它用于验证 Python file-like API 的吞吐和大文件低内存路径。
 
 运行前需要：
 
@@ -151,7 +151,7 @@ sha256 verification: ok
 ./examples/benchmark_stream_multiplex.sh
 ```
 
-该脚本使用 `LocalS3ClientAsync` 和 file-like `open()` 验证：
+该脚本使用 `ALocalS3ClientAsync.open()` 和 async file-like API 验证：
 
 - 一个 reader 打开并长时间 idle 后仍可继续读取
 - reader idle 期间，同一个客户端仍可持续执行 `health()`

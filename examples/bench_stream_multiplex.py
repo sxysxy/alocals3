@@ -14,7 +14,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from alocals3.client import LocalS3ClientAsync
+from alocals3.client import ALocalS3ClientAsync
 
 
 def _mib(value: int) -> int:
@@ -34,7 +34,7 @@ def _make_chunk(size: int, seed: str) -> bytes:
     return bytes(out[:size])
 
 
-async def _ensure_bucket(client: LocalS3ClientAsync, bucket: str) -> None:
+async def _ensure_bucket(client: ALocalS3ClientAsync, bucket: str) -> None:
     try:
         await client.create_bucket(bucket)
     except RuntimeError as exc:
@@ -43,7 +43,7 @@ async def _ensure_bucket(client: LocalS3ClientAsync, bucket: str) -> None:
 
 
 async def _health_probe(
-    client: LocalS3ClientAsync,
+    client: ALocalS3ClientAsync,
     *,
     duration: float,
     interval: float,
@@ -72,7 +72,7 @@ async def _health_probe(
 
 
 async def _write_object(
-    client: LocalS3ClientAsync,
+    client: ALocalS3ClientAsync,
     url: str,
     *,
     total_size: int,
@@ -86,19 +86,19 @@ async def _write_object(
     try:
         while remaining > 0:
             part = chunk if remaining >= len(chunk) else chunk[:remaining]
-            await asyncio.to_thread(writer.write, part)
+            await writer.write(part)
             digest.update(part)
             remaining -= len(part)
-        await asyncio.to_thread(writer.close)
+        await writer.close()
     except Exception:
-        await asyncio.to_thread(writer.discard)
+        await writer.discard()
         raise
     elapsed = time.perf_counter() - started
     return elapsed, digest.hexdigest(), writer.result
 
 
 async def _idle_reader_check(
-    client: LocalS3ClientAsync,
+    client: ALocalS3ClientAsync,
     url: str,
     *,
     chunk_size: int,
@@ -107,7 +107,7 @@ async def _idle_reader_check(
 ) -> dict[str, Any]:
     reader = await client.open(url, "rb")
     try:
-        first = await asyncio.to_thread(reader.read, chunk_size)
+        first = await reader.read(chunk_size)
         probe_task = asyncio.create_task(
             _health_probe(
                 client,
@@ -117,10 +117,10 @@ async def _idle_reader_check(
             )
         )
         await asyncio.sleep(idle_secs)
-        second = await asyncio.to_thread(reader.read, chunk_size)
+        second = await reader.read(chunk_size)
         probe = await probe_task
     finally:
-        await asyncio.to_thread(reader.close)
+        await reader.close()
     if len(first) != chunk_size or len(second) == 0:
         raise RuntimeError("idle reader failed to continue after pause")
     return {
@@ -133,7 +133,7 @@ async def _idle_reader_check(
 
 
 async def _idle_writer_and_close_check(
-    client: LocalS3ClientAsync,
+    client: ALocalS3ClientAsync,
     url: str,
     *,
     total_size: int,
@@ -144,7 +144,7 @@ async def _idle_writer_and_close_check(
 ) -> dict[str, Any]:
     writer = await client.open(url, "wb", content_type=content_type)
     try:
-        await asyncio.to_thread(writer.write, chunk)
+        await writer.write(chunk)
         idle_probe_task = asyncio.create_task(
             _health_probe(
                 client,
@@ -159,10 +159,10 @@ async def _idle_writer_and_close_check(
         remaining = total_size - len(chunk)
         while remaining > 0:
             part = chunk if remaining >= len(chunk) else chunk[:remaining]
-            await asyncio.to_thread(writer.write, part)
+            await writer.write(part)
             remaining -= len(part)
 
-        close_task = asyncio.create_task(asyncio.to_thread(writer.close))
+        close_task = asyncio.create_task(writer.close())
         close_probe_task = asyncio.create_task(
             _health_probe(
                 client,
@@ -174,7 +174,7 @@ async def _idle_writer_and_close_check(
         await close_task
         close_probe = await close_probe_task
     except Exception:
-        await asyncio.to_thread(writer.discard)
+        await writer.discard()
         raise
     return {
         "event": "idle_writer_ok",
@@ -186,7 +186,7 @@ async def _idle_writer_and_close_check(
 
 
 async def _range_resume_check(
-    client: LocalS3ClientAsync,
+    client: ALocalS3ClientAsync,
     url: str,
     *,
     total_size: int,
@@ -199,25 +199,25 @@ async def _range_resume_check(
     reader = await client.open(url, "rb")
     try:
         while offset < resume_after:
-            data = await asyncio.to_thread(reader.read, min(chunk_size, resume_after - offset))
+            data = await reader.read(min(chunk_size, resume_after - offset))
             if not data:
                 raise RuntimeError("reader ended before resume offset")
             digest.update(data)
             offset += len(data)
     finally:
-        await asyncio.to_thread(reader.close)
+        await reader.close()
 
     reader = await client.open(url, "rb", range_header=f"bytes={offset}-")
     try:
         content_range = getattr(reader, "headers", {}).get("content-range")
         while True:
-            data = await asyncio.to_thread(reader.read, chunk_size)
+            data = await reader.read(chunk_size)
             if not data:
                 break
             digest.update(data)
             offset += len(data)
     finally:
-        await asyncio.to_thread(reader.close)
+        await reader.close()
     actual = digest.hexdigest()
     if offset != total_size or actual != expected_sha256:
         raise RuntimeError("range resume verification failed")
@@ -263,7 +263,7 @@ async def main_async() -> int:
     url = _object_url(args.bucket, args.key)
     writer_url = _object_url(args.bucket, args.writer_key)
 
-    async with LocalS3ClientAsync(args.endpoint, timeout=args.timeout, disable_proxy=args.disable_proxy) as client:
+    async with ALocalS3ClientAsync(args.endpoint, timeout=args.timeout, disable_proxy=args.disable_proxy) as client:
         await _ensure_bucket(client, args.bucket)
         _print(
             {

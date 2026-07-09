@@ -167,9 +167,9 @@ Python runtime 依赖列表刻意保持为空。HTTP 网络功能在 Rust 里实
 import asyncio
 from pathlib import Path
 
-from alocals3.client import LocalS3Client, LocalS3ClientAsync
+from alocals3.client import ALocalS3Client, ALocalS3ClientAsync
 
-with LocalS3Client("http://127.0.0.1:8000", disable_proxy=True) as client:
+with ALocalS3Client("http://127.0.0.1:8000", disable_proxy=True) as client:
     client.create_bucket("demo")
     info = client.put_object("demo", "logs/数据.txt", Path("data.txt"))
     print(info["etag"])
@@ -187,8 +187,12 @@ with LocalS3Client("http://127.0.0.1:8000", disable_proxy=True) as client:
 
 
 async def main() -> None:
-    async with LocalS3ClientAsync("http://127.0.0.1:8000", disable_proxy=True) as client:
+    async with ALocalS3ClientAsync("http://127.0.0.1:8000", disable_proxy=True) as client:
         print(await client.list_buckets())
+        async with client.open("s3://demo/logs/from-async-open.txt", "wb") as f:
+            await f.write(b"hello from async file-like API\n")
+        async with client.open("s3://demo/logs/from-async-open.txt", "rb") as f:
+            print(await f.read())
 
 
 asyncio.run(main())
@@ -210,6 +214,7 @@ python -m alocals3.client --endpoint http://127.0.0.1:8000 LIST_OBJECTS_V2 demo 
 - 读模式（`"rb"` / `"r"`）会创建 Rust 持有的流式 HTTP reader。`open()` 会发起请求并读取响应头，但对象 body 会在返回文件对象的 `read()` 路径中按需从网络读取。
 - 写模式（`"wb"` / `"w"`）会把 `write()` 数据写入 Rust 持有的临时文件；正常 `close()` 或正常退出 `with` 时才发送 HTTP `PUT`。如果 `with` 块内抛异常，则丢弃上传。
 - `cache_path=` 是 best-effort，会在数据经过 file-like 对象时同步写入；cache 写失败不会导致网络读写失败。
+- asyncio 代码里使用 `ALocalS3ClientAsync.open()` 和 `async with`。返回的是 async file-like 对象，提供可 `await` 的 `read()`、`readline()`、`readinto()`、`write()`、`flush()`、`close()`、`discard()` 方法，底层复用同一套 Rust 实现。
 
 可以用大对象 benchmark 验证 Python file-like API：
 

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from alocals3._alocals3_native import RustHttpClient
 
@@ -54,8 +56,21 @@ class LocalS3Client:
     def put_object(self, bucket: str, key: str, file_path: Path, content_type: str | None = None) -> dict:
         return _loads(self._client.put_object_json(bucket, key, str(file_path), content_type))
 
+    def put_object_bytes(
+        self,
+        bucket: str,
+        key: str,
+        body: bytes | bytearray | memoryview,
+        content_type: str | None = None,
+    ) -> dict:
+        return _loads(self._client.put_object_bytes_json(bucket, key, bytes(body), content_type))
+
     def get_object(self, bucket: str, key: str, output_path: Path) -> None:
         self._client.get_object_to_file(bucket, key, str(output_path), None)
+
+    def get_object_bytes(self, bucket: str, key: str, range_header: str | None = None) -> tuple[bytes, dict]:
+        result = self._client.get_object_bytes(bucket, key, range_header)
+        return result["body"], result["headers"]
 
     def get_object_range(self, bucket: str, key: str, range_header: str) -> tuple[bytes, dict]:
         result = self._client.get_object_range(bucket, key, range_header)
@@ -72,6 +87,45 @@ class LocalS3Client:
 
     def delete_object(self, bucket: str, key: str) -> None:
         self._client.delete_object(bucket, key)
+
+    def open(
+        self,
+        url: str,
+        mode: str = "rb",
+        *,
+        encoding: str = "utf-8",
+        errors: str | None = None,
+        newline: str | None = None,
+        content_type: str | None = None,
+        cache_path: str | Path | None = None,
+    ):
+        bucket, key = _parse_object_url(url)
+        mode_info = _parse_mode(mode)
+        if mode_info["read"]:
+            body, headers = self.get_object_bytes(bucket, key)
+            if cache_path is not None:
+                _write_cache_best_effort(cache_path, body)
+            if mode_info["binary"]:
+                return _S3BytesReader(body, headers=headers, bucket=bucket, key=key)
+            return _S3TextReader(
+                body.decode(encoding, errors or "strict"),
+                headers=headers,
+                bucket=bucket,
+                key=key,
+                newline=newline,
+            )
+        if mode_info["binary"]:
+            return _S3BytesWriter(self, bucket, key, content_type=content_type, cache_path=cache_path)
+        return _S3TextWriter(
+            self,
+            bucket,
+            key,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+            content_type=content_type,
+            cache_path=cache_path,
+        )
 
     def close(self) -> None:
         return None
@@ -127,8 +181,20 @@ class LocalS3ClientAsync:
     async def put_object(self, bucket: str, key: str, file_path: Path, content_type: str | None = None) -> dict:
         return await asyncio.to_thread(self._sync.put_object, bucket, key, file_path, content_type)
 
+    async def put_object_bytes(
+        self,
+        bucket: str,
+        key: str,
+        body: bytes | bytearray | memoryview,
+        content_type: str | None = None,
+    ) -> dict:
+        return await asyncio.to_thread(self._sync.put_object_bytes, bucket, key, body, content_type)
+
     async def get_object(self, bucket: str, key: str, output_path: Path) -> None:
         await asyncio.to_thread(self._sync.get_object, bucket, key, output_path)
+
+    async def get_object_bytes(self, bucket: str, key: str, range_header: str | None = None) -> tuple[bytes, dict]:
+        return await asyncio.to_thread(self._sync.get_object_bytes, bucket, key, range_header)
 
     async def get_object_range(self, bucket: str, key: str, range_header: str) -> tuple[bytes, dict]:
         return await asyncio.to_thread(self._sync.get_object_range, bucket, key, range_header)
@@ -145,6 +211,28 @@ class LocalS3ClientAsync:
     async def delete_object(self, bucket: str, key: str) -> None:
         await asyncio.to_thread(self._sync.delete_object, bucket, key)
 
+    async def open(
+        self,
+        url: str,
+        mode: str = "rb",
+        *,
+        encoding: str = "utf-8",
+        errors: str | None = None,
+        newline: str | None = None,
+        content_type: str | None = None,
+        cache_path: str | Path | None = None,
+    ):
+        return await asyncio.to_thread(
+            self._sync.open,
+            url,
+            mode,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+            content_type=content_type,
+            cache_path=cache_path,
+        )
+
     async def close(self) -> None:
         self._sync.close()
 
@@ -154,6 +242,175 @@ class LocalS3ClientAsync:
 
 def _loads(value: str) -> Any:
     return json.loads(value)
+
+
+class _S3ObjectMixin:
+    headers: dict
+    bucket: str
+    key: str
+
+
+class _S3BytesReader(_S3ObjectMixin, io.BytesIO):
+    def __init__(self, body: bytes, *, headers: dict, bucket: str, key: str) -> None:
+        super().__init__(body)
+        self.headers = headers
+        self.bucket = bucket
+        self.key = key
+
+
+class _S3TextReader(_S3ObjectMixin, io.StringIO):
+    def __init__(
+        self,
+        body: str,
+        *,
+        headers: dict,
+        bucket: str,
+        key: str,
+        newline: str | None,
+    ) -> None:
+        super().__init__(body, newline=newline)
+        self.headers = headers
+        self.bucket = bucket
+        self.key = key
+
+
+class _S3BytesWriter(io.BytesIO):
+    def __init__(
+        self,
+        client: LocalS3Client,
+        bucket: str,
+        key: str,
+        *,
+        content_type: str | None,
+        cache_path: str | Path | None,
+    ) -> None:
+        super().__init__()
+        self._client = client
+        self.bucket = bucket
+        self.key = key
+        self.content_type = content_type
+        self.cache_path = cache_path
+        self.result: dict | None = None
+        self._uploaded = False
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                if not self._uploaded:
+                    self._upload()
+            finally:
+                super().close()
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        try:
+            if exc_type is None and not self._uploaded:
+                self._upload()
+        finally:
+            super().close()
+
+    def _upload(self) -> None:
+        body = self.getvalue()
+        self.result = self._client.put_object_bytes(self.bucket, self.key, body, self.content_type)
+        if self.cache_path is not None:
+            _write_cache_best_effort(self.cache_path, body)
+        self._uploaded = True
+
+
+class _S3TextWriter(io.StringIO):
+    def __init__(
+        self,
+        client: LocalS3Client,
+        bucket: str,
+        key: str,
+        *,
+        encoding: str,
+        errors: str | None,
+        newline: str | None,
+        content_type: str | None,
+        cache_path: str | Path | None,
+    ) -> None:
+        super().__init__(newline=newline)
+        self._client = client
+        self.bucket = bucket
+        self.key = key
+        self._encoding = encoding
+        self._errors = errors or "strict"
+        self.content_type = content_type
+        self.cache_path = cache_path
+        self.result: dict | None = None
+        self._uploaded = False
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                if not self._uploaded:
+                    self._upload()
+            finally:
+                super().close()
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        try:
+            if exc_type is None and not self._uploaded:
+                self._upload()
+        finally:
+            super().close()
+
+    def _upload(self) -> None:
+        body = self.getvalue().encode(self._encoding, self._errors)
+        self.result = self._client.put_object_bytes(self.bucket, self.key, body, self.content_type)
+        if self.cache_path is not None:
+            _write_cache_best_effort(self.cache_path, body)
+        self._uploaded = True
+
+
+def _parse_mode(mode: str) -> dict:
+    if not mode:
+        raise ValueError("mode must not be empty")
+    if "+" in mode or "a" in mode or "x" in mode:
+        raise ValueError("S3 object open() supports read-only or overwrite-only modes, not update/append/exclusive modes")
+    if "b" in mode and "t" in mode:
+        raise ValueError("mode cannot contain both 'b' and 't'")
+    read = "r" in mode
+    write = "w" in mode
+    if read == write:
+        raise ValueError("mode must contain exactly one of 'r' or 'w'")
+    allowed = {"r", "w", "b", "t"}
+    extra = set(mode) - allowed
+    if extra:
+        raise ValueError(f"unsupported mode character(s): {''.join(sorted(extra))}")
+    return {"read": read, "write": write, "binary": "b" in mode}
+
+
+def _parse_object_url(url: str) -> tuple[str, str]:
+    parsed = urlparse(url)
+    if parsed.scheme == "s3":
+        bucket = parsed.netloc
+        key = unquote(parsed.path.lstrip("/"))
+    elif parsed.scheme in {"http", "https"}:
+        parts = [unquote(part) for part in parsed.path.split("/") if part]
+        if len(parts) < 3 or parts[0] != "s3":
+            raise ValueError("HTTP object URL must have path /s3/{bucket}/{key}")
+        bucket = parts[1]
+        key = "/".join(parts[2:])
+    elif parsed.scheme:
+        raise ValueError(f"unsupported object URL scheme: {parsed.scheme}")
+    else:
+        bucket, sep, key = url.lstrip("/").partition("/")
+        if not sep:
+            raise ValueError("object URL must be s3://bucket/key, /bucket/key, or an HTTP /s3/{bucket}/{key} URL")
+    if not bucket or not key:
+        raise ValueError("object URL must include both bucket and key")
+    return bucket, key
+
+
+def _write_cache_best_effort(path: str | Path, body: bytes) -> None:
+    try:
+        cache_path = Path(path)
+        if cache_path.parent != Path(""):
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(body)
+    except OSError:
+        pass
 
 
 def _build_parser() -> argparse.ArgumentParser:

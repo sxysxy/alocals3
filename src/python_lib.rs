@@ -124,6 +124,49 @@ impl RustHttpClient {
         self.request_json(request)
     }
 
+    #[pyo3(signature = (bucket, key, body, content_type=None))]
+    fn put_object_bytes_json(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> PyResult<String> {
+        let mut request = self
+            .client
+            .put(self.url(&object_path(bucket, key)))
+            .body(body.to_vec());
+        if let Some(content_type) = content_type {
+            request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+        }
+        self.request_json(request)
+    }
+
+    #[pyo3(signature = (bucket, key, range_header=None))]
+    fn get_object_bytes(
+        &self,
+        py: Python<'_>,
+        bucket: &str,
+        key: &str,
+        range_header: Option<&str>,
+    ) -> PyResult<PyObject> {
+        let mut request = self.client.get(self.url(&object_path(bucket, key)));
+        if let Some(range_header) = range_header {
+            request = request.header(reqwest::header::RANGE, range_header);
+        }
+        let response = request.send().map_err(http_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_status_error(status.as_u16()));
+        }
+        let headers = response.headers().clone();
+        let body = response.bytes().map_err(http_error)?;
+        let result = PyDict::new_bound(py);
+        result.set_item("body", PyBytes::new_bound(py, &body))?;
+        result.set_item("headers", headers_to_dict(py, &headers)?)?;
+        Ok(result.into())
+    }
+
     #[pyo3(signature = (bucket, key, output_path, range_header=None))]
     fn get_object_to_file(
         &self,

@@ -154,6 +154,12 @@ with LocalS3Client("http://127.0.0.1:8000", disable_proxy=True) as client:
     data, headers = client.get_object_range("demo", "logs/数据.txt", "bytes=0-99")
     print(len(data), headers.get("content-range"))
 
+    with client.open("s3://demo/logs/数据.txt", "r") as f:
+        print(f.read())
+
+    with client.open("s3://demo/logs/from-open.txt", "wb") as f:
+        f.write(b"hello from file-like API\n")
+
     client.get_object_to_file("demo", "logs/数据.txt", Path("copy.txt"))
 
 

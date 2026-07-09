@@ -15,12 +15,14 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{PgPool, Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::{Mutex, Notify};
+use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -58,22 +60,55 @@ struct Args {
     log_level: String,
     #[arg(long, env = "ALOCALS3_MAX_UPLOAD_SIZE", default_value_t = 0)]
     max_upload_size: usize,
+    #[arg(long, env = "ALOCALS3_DISABLE_GC", default_value_t = false)]
+    disable_gc: bool,
+    #[arg(long, env = "ALOCALS3_GC_INTERVAL_SECS", default_value_t = 300)]
+    gc_interval_secs: u64,
+    #[arg(long, env = "ALOCALS3_GC_GRACE_SECS", default_value_t = 300)]
+    gc_grace_secs: u64,
+    #[arg(long, env = "ALOCALS3_GC_START_DELAY_SECS", default_value_t = 30)]
+    gc_start_delay_secs: u64,
 }
 
 #[derive(Clone)]
 struct AppState {
     storage: Arc<Storage>,
+    gc: Option<Arc<GarbageCollector>>,
+}
+
+struct GarbageCollector {
+    storage: Arc<Storage>,
+    interval: Duration,
+    grace: Duration,
+    start_delay: Duration,
+    running: AtomicBool,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct GcReport {
+    orphan_files_deleted: u64,
+    orphan_bytes_deleted: u64,
+    missing_records_deleted: u64,
+    stale_tmp_files_deleted: u64,
+    empty_dirs_removed: u64,
 }
 
 enum Storage {
     Sqlite {
         pool: SqlitePool,
         objects_root: PathBuf,
+        gc_state: Arc<GcState>,
     },
     Postgres {
         pool: PgPool,
         objects_root: PathBuf,
+        gc_state: Arc<GcState>,
     },
+}
+
+struct GcState {
+    active_writes: Mutex<HashMap<String, usize>>,
 }
 
 #[derive(Clone)]
@@ -88,6 +123,12 @@ struct ObjectRow {
     size: i64,
     content_type: String,
     etag: String,
+    updated_at: String,
+}
+
+struct GcObjectRef {
+    id: i64,
+    file_path: String,
     updated_at: String,
 }
 
@@ -161,6 +202,84 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult<T> = Result<T, ApiError>;
+
+impl GarbageCollector {
+    fn start(
+        storage: Arc<Storage>,
+        interval: Duration,
+        grace: Duration,
+        start_delay: Duration,
+    ) -> Arc<Self> {
+        let gc = Arc::new(Self {
+            storage,
+            interval,
+            grace,
+            start_delay,
+            running: AtomicBool::new(false),
+            notify: Notify::new(),
+        });
+        let task_gc = Arc::clone(&gc);
+        tokio::spawn(async move {
+            task_gc.run_loop().await;
+        });
+        gc
+    }
+
+    fn trigger(&self) {
+        self.notify.notify_one();
+    }
+
+    async fn run_loop(self: Arc<Self>) {
+        if !self.start_delay.is_zero() {
+            tokio::time::sleep(self.start_delay).await;
+        }
+        self.run_once("startup").await;
+
+        let mut interval = tokio::time::interval(self.interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => self.run_once("periodic").await,
+                _ = self.notify.notified() => self.run_once("triggered").await,
+            }
+        }
+    }
+
+    async fn run_once(&self, reason: &'static str) {
+        if self.running.swap(true, Ordering::AcqRel) {
+            tracing::debug!(reason, "gc skipped because another run is active");
+            return;
+        }
+
+        let started = Instant::now();
+        let result = self.storage.garbage_collect(self.grace).await;
+        self.running.store(false, Ordering::Release);
+
+        match result {
+            Ok(report) => {
+                tracing::info!(
+                    reason,
+                    duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    orphan_files_deleted = report.orphan_files_deleted,
+                    orphan_bytes_deleted = report.orphan_bytes_deleted,
+                    missing_records_deleted = report.missing_records_deleted,
+                    stale_tmp_files_deleted = report.stale_tmp_files_deleted,
+                    empty_dirs_removed = report.empty_dirs_removed,
+                    "gc completed"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    reason,
+                    duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    error = %err.detail,
+                    "gc failed"
+                );
+            }
+        }
+    }
+}
 
 fn init_logging(log_level: &str) -> anyhow::Result<()> {
     let filter = EnvFilter::try_new(log_level).or_else(|_| EnvFilter::try_new("info"))?;
@@ -264,9 +383,24 @@ async fn main() -> anyhow::Result<()> {
         database_backend = database_backend(&args.database_url),
         storage_root = %args.storage_root.display(),
         max_upload_size = args.max_upload_size,
+        disable_gc = args.disable_gc,
+        gc_interval_secs = args.gc_interval_secs,
+        gc_grace_secs = args.gc_grace_secs,
+        gc_start_delay_secs = args.gc_start_delay_secs,
         "starting alocals3 server"
     );
     let storage = Arc::new(Storage::connect(&args.database_url, args.storage_root).await?);
+    let gc = if args.disable_gc || args.gc_interval_secs == 0 {
+        tracing::info!("background gc disabled");
+        None
+    } else {
+        Some(GarbageCollector::start(
+            Arc::clone(&storage),
+            Duration::from_secs(args.gc_interval_secs),
+            Duration::from_secs(args.gc_grace_secs),
+            Duration::from_secs(args.gc_start_delay_secs),
+        ))
+    };
     let body_limit = if args.max_upload_size == 0 {
         DefaultBodyLimit::disable()
     } else {
@@ -291,7 +425,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .layer(body_limit)
         .layer(from_fn(request_logging))
-        .with_state(AppState { storage });
+        .with_state(AppState { storage, gc });
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -434,6 +568,11 @@ async fn put_object(
         .storage
         .put_object(&bucket, &key, &body, content_type.as_deref())
         .await?;
+    if !created {
+        if let Some(gc) = &state.gc {
+            gc.trigger();
+        }
+    }
     let mut response = (
         if created {
             StatusCode::CREATED
@@ -479,6 +618,9 @@ async fn delete_object(
     AxumPath((bucket, key)): AxumPath<(String, String)>,
 ) -> ApiResult<StatusCode> {
     state.storage.delete_object(&bucket, &key).await?;
+    if let Some(gc) = &state.gc {
+        gc.trigger();
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -486,6 +628,9 @@ impl Storage {
     async fn connect(database_url: &str, root: PathBuf) -> anyhow::Result<Self> {
         let objects_root = root.join("objects");
         tokio::fs::create_dir_all(&objects_root).await?;
+        let gc_state = Arc::new(GcState {
+            active_writes: Mutex::new(HashMap::new()),
+        });
         if database_url.starts_with("sqlite") {
             let path = sqlite_path(database_url);
             if let Some(parent) = path.parent() {
@@ -503,14 +648,22 @@ impl Storage {
                 .connect_with(options)
                 .await?;
             init_sqlite(&pool).await?;
-            return Ok(Self::Sqlite { pool, objects_root });
+            return Ok(Self::Sqlite {
+                pool,
+                objects_root,
+                gc_state,
+            });
         }
         let pool = PgPoolOptions::new()
             .max_connections(32)
             .connect(database_url)
             .await?;
         init_pg(&pool).await?;
-        Ok(Self::Postgres { pool, objects_root })
+        Ok(Self::Postgres {
+            pool,
+            objects_root,
+            gc_state,
+        })
     }
 
     async fn list_buckets(&self) -> ApiResult<Vec<BucketInfo>> {
@@ -695,28 +848,34 @@ impl Storage {
         let etag = format!("{:x}", md5::compute(body));
         let digest = hex_sha256(body);
         let relative_path = format!("{}/{}/{}", &digest[..2], &digest[2..4], digest);
-        let objects_root = self.objects_root();
-        atomic_write_blob(&objects_root.join(&relative_path), body).await?;
-        let now = now_utc();
-        let final_content_type = content_type.map(str::to_string).unwrap_or_else(|| {
-            mime_guess::from_path(&normalized_key)
-                .first_raw()
-                .unwrap_or("application/octet-stream")
-                .to_string()
-        });
-        let created = self
-            .upsert_object(
-                bucket_row.id,
-                &normalized_key,
-                &relative_path,
-                body.len() as i64,
-                &final_content_type,
-                &etag,
-                &now,
-            )
-            .await?;
-        let row = self.object_row(bucket_row.id, &normalized_key).await?;
-        Ok((row.info(bucket), created))
+        self.register_active_write(&relative_path).await;
+        let result = async {
+            let objects_root = self.objects_root();
+            atomic_write_blob(&objects_root.join(&relative_path), body).await?;
+            let now = now_utc();
+            let final_content_type = content_type.map(str::to_string).unwrap_or_else(|| {
+                mime_guess::from_path(&normalized_key)
+                    .first_raw()
+                    .unwrap_or("application/octet-stream")
+                    .to_string()
+            });
+            let created = self
+                .upsert_object(
+                    bucket_row.id,
+                    &normalized_key,
+                    &relative_path,
+                    body.len() as i64,
+                    &final_content_type,
+                    &etag,
+                    &now,
+                )
+                .await?;
+            let row = self.object_row(bucket_row.id, &normalized_key).await?;
+            Ok((row.info(bucket), created))
+        }
+        .await;
+        self.unregister_active_write(&relative_path).await;
+        result
     }
 
     async fn get_object(&self, bucket: &str, key: &str) -> ApiResult<StoredObject> {
@@ -771,11 +930,192 @@ impl Storage {
         Ok(())
     }
 
+    async fn garbage_collect(&self, grace: Duration) -> ApiResult<GcReport> {
+        let objects_root = self.objects_root();
+        tokio::fs::create_dir_all(&objects_root).await?;
+
+        let refs = self.object_refs_for_gc().await?;
+        let mut referenced_paths = HashSet::with_capacity(refs.len());
+        let mut report = GcReport::default();
+
+        for object_ref in &refs {
+            if !is_safe_storage_relative_path(&object_ref.file_path) {
+                tracing::warn!(
+                    file_path = %object_ref.file_path,
+                    object_id = object_ref.id,
+                    "gc skipped unsafe object file_path"
+                );
+                continue;
+            }
+            referenced_paths.insert(object_ref.file_path.clone());
+            let absolute_path = objects_root.join(&object_ref.file_path);
+            match tokio::fs::metadata(&absolute_path).await {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => {
+                    tracing::warn!(
+                        file_path = %object_ref.file_path,
+                        object_id = object_ref.id,
+                        "gc found object file_path that is not a file"
+                    );
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    if rfc3339_older_than(&object_ref.updated_at, grace) {
+                        report.missing_records_deleted += self
+                            .delete_gc_object_ref(
+                                object_ref.id,
+                                &object_ref.file_path,
+                                &object_ref.updated_at,
+                            )
+                            .await?;
+                    }
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        let mut pending_dirs = Vec::new();
+        let mut stack = vec![objects_root.clone()];
+        while let Some(dir) = stack.pop() {
+            let mut entries = match tokio::fs::read_dir(&dir).await {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                let file_type = entry.file_type().await?;
+                if file_type.is_dir() {
+                    pending_dirs.push(path.clone());
+                    stack.push(path);
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+
+                let metadata = entry.metadata().await?;
+                if !file_older_than(&metadata, grace) {
+                    continue;
+                }
+
+                if is_stale_tmp_file(&path) {
+                    if let Some(active_path) = active_path_for_tmp(&objects_root, &path) {
+                        if self.is_active_write(&active_path).await {
+                            continue;
+                        }
+                    }
+                    let bytes = metadata.len();
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => {
+                            report.stale_tmp_files_deleted += 1;
+                            report.orphan_bytes_deleted += bytes;
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                    continue;
+                }
+
+                let Some(relative_path) = storage_relative_path(&objects_root, &path) else {
+                    continue;
+                };
+                if referenced_paths.contains(&relative_path) {
+                    continue;
+                }
+
+                if let Some(bytes) = self
+                    .remove_orphan_file_if_still_unreferenced(&path, &relative_path, grace)
+                    .await?
+                {
+                    report.orphan_files_deleted += 1;
+                    report.orphan_bytes_deleted += bytes;
+                }
+            }
+        }
+
+        pending_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+        for dir in pending_dirs {
+            match tokio::fs::remove_dir(&dir).await {
+                Ok(()) => report.empty_dirs_removed += 1,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Ok(report)
+    }
+
     fn objects_root(&self) -> PathBuf {
         match self {
             Self::Sqlite { objects_root, .. } | Self::Postgres { objects_root, .. } => {
                 objects_root.clone()
             }
+        }
+    }
+
+    fn gc_state(&self) -> Arc<GcState> {
+        match self {
+            Self::Sqlite { gc_state, .. } | Self::Postgres { gc_state, .. } => Arc::clone(gc_state),
+        }
+    }
+
+    async fn register_active_write(&self, relative_path: &str) {
+        let gc_state = self.gc_state();
+        let mut active_writes = gc_state.active_writes.lock().await;
+        *active_writes.entry(relative_path.to_string()).or_insert(0) += 1;
+    }
+
+    async fn unregister_active_write(&self, relative_path: &str) {
+        let gc_state = self.gc_state();
+        let mut active_writes = gc_state.active_writes.lock().await;
+        if let Some(count) = active_writes.get_mut(relative_path) {
+            *count -= 1;
+            if *count == 0 {
+                active_writes.remove(relative_path);
+            }
+        }
+    }
+
+    async fn is_active_write(&self, relative_path: &str) -> bool {
+        self.gc_state()
+            .active_writes
+            .lock()
+            .await
+            .contains_key(relative_path)
+    }
+
+    async fn remove_orphan_file_if_still_unreferenced(
+        &self,
+        path: &Path,
+        relative_path: &str,
+        grace: Duration,
+    ) -> ApiResult<Option<u64>> {
+        let gc_state = self.gc_state();
+        let active_writes = gc_state.active_writes.lock().await;
+        if active_writes.contains_key(relative_path) {
+            return Ok(None);
+        }
+        if self.file_path_ref_count(relative_path).await? > 0 {
+            return Ok(None);
+        }
+        let metadata = match tokio::fs::metadata(path).await {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => return Ok(None),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        if !file_older_than(&metadata, grace) {
+            return Ok(None);
+        }
+        let bytes = metadata.len();
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(Some(bytes)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
         }
     }
 
@@ -862,6 +1202,87 @@ impl Storage {
                 Ok(row.map(object_row_from_pg))
             }
         }
+    }
+
+    async fn object_refs_for_gc(&self) -> ApiResult<Vec<GcObjectRef>> {
+        match self {
+            Self::Sqlite { pool, .. } => {
+                let rows =
+                    sqlx::query("SELECT id, file_path, updated_at FROM objects ORDER BY id ASC")
+                        .fetch_all(pool)
+                        .await?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| GcObjectRef {
+                        id: row.get(0),
+                        file_path: row.get(1),
+                        updated_at: row.get(2),
+                    })
+                    .collect())
+            }
+            Self::Postgres { pool, .. } => {
+                let rows =
+                    sqlx::query("SELECT id, file_path, updated_at FROM objects ORDER BY id ASC")
+                        .fetch_all(pool)
+                        .await?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| GcObjectRef {
+                        id: row.get(0),
+                        file_path: row.get(1),
+                        updated_at: row.get(2),
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    async fn file_path_ref_count(&self, file_path: &str) -> ApiResult<i64> {
+        match self {
+            Self::Sqlite { pool, .. } => {
+                let row = sqlx::query("SELECT COUNT(*) FROM objects WHERE file_path = ?1")
+                    .bind(file_path)
+                    .fetch_one(pool)
+                    .await?;
+                Ok(row.get(0))
+            }
+            Self::Postgres { pool, .. } => {
+                let row = sqlx::query("SELECT COUNT(*) FROM objects WHERE file_path = $1")
+                    .bind(file_path)
+                    .fetch_one(pool)
+                    .await?;
+                Ok(row.get(0))
+            }
+        }
+    }
+
+    async fn delete_gc_object_ref(
+        &self,
+        id: i64,
+        file_path: &str,
+        updated_at: &str,
+    ) -> ApiResult<u64> {
+        let rows_affected = match self {
+            Self::Sqlite { pool, .. } => sqlx::query(
+                "DELETE FROM objects WHERE id = ?1 AND file_path = ?2 AND updated_at = ?3",
+            )
+            .bind(id)
+            .bind(file_path)
+            .bind(updated_at)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+            Self::Postgres { pool, .. } => sqlx::query(
+                "DELETE FROM objects WHERE id = $1 AND file_path = $2 AND updated_at = $3",
+            )
+            .bind(id)
+            .bind(file_path)
+            .bind(updated_at)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+        };
+        Ok(rows_affected)
     }
 
     async fn upsert_object(
@@ -1129,6 +1550,68 @@ fn normalize_key(key: &str) -> ApiResult<String> {
         ));
     }
     Ok(normalized.to_string())
+}
+
+fn is_safe_storage_relative_path(value: &str) -> bool {
+    let path = Path::new(value);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn storage_relative_path(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_str()?),
+            _ => return None,
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn active_path_for_tmp(root: &Path, path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let stripped = file_name.strip_prefix('.')?;
+    let (target_name, _) = stripped.split_once('.')?;
+    if target_name.is_empty() {
+        return None;
+    }
+    let parent = path.parent()?;
+    storage_relative_path(root, &parent.join(target_name))
+}
+
+fn file_older_than(metadata: &std::fs::Metadata, grace: Duration) -> bool {
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age >= grace)
+        .unwrap_or(false)
+}
+
+fn rfc3339_older_than(value: &str, grace: Duration) -> bool {
+    let Ok(updated_at) = DateTime::parse_from_rfc3339(value) else {
+        return false;
+    };
+    let Ok(grace) = chrono::Duration::from_std(grace) else {
+        return false;
+    };
+    Utc::now().signed_duration_since(updated_at.with_timezone(&Utc)) >= grace
+}
+
+fn is_stale_tmp_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.starts_with('.') && name.ends_with(".tmp"))
+        .unwrap_or(false)
 }
 
 fn validate_content_md5(headers: &HeaderMap, body: &[u8]) -> ApiResult<()> {

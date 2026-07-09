@@ -28,6 +28,31 @@ target/release/alocals3-server \
   --storage-root ./data
 ```
 
+Background garbage collection is enabled by default. It periodically removes object files that are no longer referenced by the database and removes database records whose files are missing. Candidates must be older than the GC grace period before they are deleted.
+
+```bash
+target/release/alocals3-server \
+  --gc-interval-secs 300 \
+  --gc-grace-secs 300 \
+  --gc-start-delay-secs 30
+```
+
+Set `--disable-gc` to disable background GC. `--gc-interval-secs 0` and `ALOCALS3_GC_INTERVAL_SECS=0` are equivalent.
+
+Run the reproducible GC correctness suite:
+
+```bash
+./examples/gc_correctness.sh
+```
+
+It covers orphan files, missing-file records, stale temp files, live/shared object retention, grace-period behavior, GC disable modes, and orphan-path reuse races. Latest local result:
+
+```text
+GC correctness and race scenarios passed
+orphan_files_deleted=1 missing_records_deleted=1 stale_tmp_files_deleted=1
+remaining_objects: grace=1 disable_flag=1 interval_zero=1 race=30
+```
+
 Use PostgreSQL instead of SQLite:
 
 ```bash
@@ -181,6 +206,26 @@ python -m alocals3.client --endpoint http://127.0.0.1:8000 LIST_OBJECTS_V2 demo 
 ```
 
 Set `disable_proxy=True` or pass `--disable-proxy` to ignore proxy environment variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`.
+
+`client.open()` is file-like but not an in-memory object wrapper:
+
+- Read modes (`"rb"` / `"r"`) create a Rust-backed streaming HTTP reader. `open()` sends the request and reads response headers, but object bytes are pulled from the network when the returned file object's `read()` path runs.
+- Write modes (`"wb"` / `"w"`) spool writes to a Rust-owned temporary file. The HTTP `PUT` is sent when the file is closed or the `with` block exits successfully. If the `with` block exits with an exception, the upload is discarded.
+- `cache_path=` is best-effort and is populated as bytes pass through the file-like object; cache write failures do not fail the network operation.
+
+Benchmark the Python file-like API with a large object:
+
+```bash
+./examples/benchmark_file_like.sh
+```
+
+Validate stream multiplexing and Range-based resume reads:
+
+```bash
+./examples/benchmark_stream_multiplex.sh
+```
+
+The current file-like API supports resume reads through `range_header="bytes=N-"`. Upload resume is not implemented yet; write modes spool to a Rust-owned temporary file and use one HTTP `PUT` on close.
 
 ## Curl Examples
 

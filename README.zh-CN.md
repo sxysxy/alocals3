@@ -26,6 +26,31 @@ target/release/alocals3-server \
   --storage-root ./data
 ```
 
+后台垃圾回收默认开启，会定期清理数据库不再引用的对象文件，以及文件已经不存在的数据库记录。候选项必须超过 GC grace period 才会被删除。
+
+```bash
+target/release/alocals3-server \
+  --gc-interval-secs 300 \
+  --gc-grace-secs 300 \
+  --gc-start-delay-secs 30
+```
+
+设置 `--disable-gc` 可以关闭后台 GC。`--gc-interval-secs 0` 和 `ALOCALS3_GC_INTERVAL_SECS=0` 与它等效。
+
+运行可复现的 GC 正确性测试：
+
+```bash
+./examples/gc_correctness.sh
+```
+
+该测试覆盖 orphan 文件、missing-file 记录、过期临时文件、活跃/共享对象保留、grace period、GC 禁用方式，以及 orphan content path 被新 PUT 复用时的竞态。最近一次本机验证结果：
+
+```text
+GC correctness and race scenarios passed
+orphan_files_deleted=1 missing_records_deleted=1 stale_tmp_files_deleted=1
+remaining_objects: grace=1 disable_flag=1 interval_zero=1 race=30
+```
+
 使用 PostgreSQL：
 
 ```bash
@@ -179,6 +204,26 @@ python -m alocals3.client --endpoint http://127.0.0.1:8000 LIST_OBJECTS_V2 demo 
 ```
 
 设置 `disable_proxy=True` 或传 `--disable-proxy` 可以忽略 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 等代理环境变量。
+
+`client.open()` 是 file-like API，但不是简单的内存对象包装：
+
+- 读模式（`"rb"` / `"r"`）会创建 Rust 持有的流式 HTTP reader。`open()` 会发起请求并读取响应头，但对象 body 会在返回文件对象的 `read()` 路径中按需从网络读取。
+- 写模式（`"wb"` / `"w"`）会把 `write()` 数据写入 Rust 持有的临时文件；正常 `close()` 或正常退出 `with` 时才发送 HTTP `PUT`。如果 `with` 块内抛异常，则丢弃上传。
+- `cache_path=` 是 best-effort，会在数据经过 file-like 对象时同步写入；cache 写失败不会导致网络读写失败。
+
+可以用大对象 benchmark 验证 Python file-like API：
+
+```bash
+./examples/benchmark_file_like.sh
+```
+
+可以用下面的脚本验证 stream 多路复用和基于 Range 的断点续读：
+
+```bash
+./examples/benchmark_stream_multiplex.sh
+```
+
+当前 file-like API 支持通过 `range_header="bytes=N-"` 断点续读。上传断点续传尚未实现；写模式会先写入 Rust 持有的临时文件，并在 `close()` 时用一次 HTTP `PUT` 上传。
 
 ## Curl 示例
 

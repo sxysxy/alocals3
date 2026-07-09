@@ -6,7 +6,7 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyModule};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -27,6 +27,26 @@ struct RustStorageBackend {
 struct RustHttpClient {
     base_url: String,
     client: reqwest::blocking::Client,
+    stream_client: reqwest::blocking::Client,
+}
+
+#[pyclass]
+struct RustObjectReader {
+    response: Option<reqwest::blocking::Response>,
+    headers: reqwest::header::HeaderMap,
+    closed: bool,
+}
+
+#[pyclass]
+struct RustObjectWriter {
+    client: reqwest::blocking::Client,
+    url: String,
+    content_type: Option<String>,
+    temp_path: PathBuf,
+    file: Option<File>,
+    closed: bool,
+    uploaded: bool,
+    result_json: Option<String>,
 }
 
 #[pymethods]
@@ -34,15 +54,22 @@ impl RustHttpClient {
     #[new]
     #[pyo3(signature = (base_url="http://127.0.0.1:8000", timeout=10.0, disable_proxy=false))]
     fn new(base_url: &str, timeout: f64, disable_proxy: bool) -> PyResult<Self> {
+        let timeout = std::time::Duration::from_secs_f64(timeout.max(0.001));
         let mut builder = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs_f64(timeout.max(0.001)));
+            .timeout(timeout);
         if disable_proxy {
             builder = builder.no_proxy();
         }
         let client = builder.build().map_err(http_error)?;
+        let mut stream_builder = reqwest::blocking::Client::builder().connect_timeout(timeout);
+        if disable_proxy {
+            stream_builder = stream_builder.no_proxy();
+        }
+        let stream_client = stream_builder.build().map_err(http_error)?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client,
+            stream_client,
         })
     }
 
@@ -150,7 +177,7 @@ impl RustHttpClient {
         key: &str,
         range_header: Option<&str>,
     ) -> PyResult<PyObject> {
-        let mut request = self.client.get(self.url(&object_path(bucket, key)));
+        let mut request = self.stream_client.get(self.url(&object_path(bucket, key)));
         if let Some(range_header) = range_header {
             request = request.header(reqwest::header::RANGE, range_header);
         }
@@ -165,6 +192,54 @@ impl RustHttpClient {
         result.set_item("body", PyBytes::new_bound(py, &body))?;
         result.set_item("headers", headers_to_dict(py, &headers)?)?;
         Ok(result.into())
+    }
+
+    #[pyo3(signature = (bucket, key, range_header=None))]
+    fn open_object_reader(
+        &self,
+        bucket: &str,
+        key: &str,
+        range_header: Option<&str>,
+    ) -> PyResult<RustObjectReader> {
+        let mut request = self.client.get(self.url(&object_path(bucket, key)));
+        if let Some(range_header) = range_header {
+            request = request.header(reqwest::header::RANGE, range_header);
+        }
+        let response = request.send().map_err(http_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_status_error(status.as_u16()));
+        }
+        let headers = response.headers().clone();
+        Ok(RustObjectReader {
+            response: Some(response),
+            headers,
+            closed: false,
+        })
+    }
+
+    #[pyo3(signature = (bucket, key, content_type=None))]
+    fn open_object_writer(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+    ) -> PyResult<RustObjectWriter> {
+        let temp_path = std::env::temp_dir().join(format!(
+            "alocals3-upload-{}.tmp",
+            Uuid::new_v4().simple()
+        ));
+        let file = File::create(&temp_path).map_err(io_error)?;
+        Ok(RustObjectWriter {
+            client: self.stream_client.clone(),
+            url: self.url(&object_path(bucket, key)),
+            content_type: content_type.map(str::to_string),
+            temp_path,
+            file: Some(file),
+            closed: false,
+            uploaded: false,
+            result_json: None,
+        })
     }
 
     #[pyo3(signature = (bucket, key, output_path, range_header=None))]
@@ -245,6 +320,144 @@ impl RustHttpClient {
             return Err(http_status_error(status.as_u16()));
         }
         Ok(())
+    }
+}
+
+#[pymethods]
+impl RustObjectReader {
+    #[pyo3(signature = (size=-1))]
+    fn read(&mut self, py: Python<'_>, size: isize) -> PyResult<PyObject> {
+        if self.closed {
+            return Err(PyRuntimeError::new_err("I/O operation on closed S3 reader"));
+        }
+        if size == 0 {
+            return Ok(PyBytes::new_bound(py, &[]).into());
+        }
+        let Some(response) = self.response.as_mut() else {
+            return Ok(PyBytes::new_bound(py, &[]).into());
+        };
+        let body = py
+            .allow_threads(|| -> std::io::Result<Vec<u8>> {
+                if size < 0 {
+                    let mut out = Vec::new();
+                    response.read_to_end(&mut out)?;
+                    Ok(out)
+                } else {
+                    let mut out = vec![0; size as usize];
+                    let n = response.read(&mut out)?;
+                    out.truncate(n);
+                    Ok(out)
+                }
+            })
+            .map_err(io_error)?;
+        Ok(PyBytes::new_bound(py, &body).into())
+    }
+
+    fn close(&mut self) {
+        self.response.take();
+        self.closed = true;
+    }
+
+    fn headers(&self, py: Python<'_>) -> PyResult<PyObject> {
+        headers_to_dict(py, &self.headers)
+    }
+
+    fn readable(&self) -> bool {
+        !self.closed
+    }
+
+    fn closed(&self) -> bool {
+        self.closed
+    }
+}
+
+#[pymethods]
+impl RustObjectWriter {
+    fn write(&mut self, py: Python<'_>, body: &[u8]) -> PyResult<usize> {
+        if self.closed {
+            return Err(PyRuntimeError::new_err("I/O operation on closed S3 writer"));
+        }
+        let Some(file) = self.file.as_mut() else {
+            return Err(PyRuntimeError::new_err("S3 writer has no open spool file"));
+        };
+        py.allow_threads(|| file.write_all(body)).map_err(io_error)?;
+        Ok(body.len())
+    }
+
+    fn flush(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.closed {
+            return Err(PyRuntimeError::new_err("I/O operation on closed S3 writer"));
+        }
+        if let Some(file) = self.file.as_mut() {
+            py.allow_threads(|| file.flush()).map_err(io_error)?;
+        }
+        Ok(())
+    }
+
+    fn close(&mut self, py: Python<'_>) -> PyResult<String> {
+        if self.closed {
+            return Ok(self.result_json.clone().unwrap_or_default());
+        }
+        if let Some(mut file) = self.file.take() {
+            py.allow_threads(|| file.flush()).map_err(io_error)?;
+        }
+        let temp_path = self.temp_path.clone();
+        let client = self.client.clone();
+        let url = self.url.clone();
+        let content_type = self.content_type.clone();
+        let result = py
+            .allow_threads(move || -> Result<String, PyErr> {
+                let len = fs::metadata(&temp_path).map_err(io_error)?.len();
+                let file = File::open(&temp_path).map_err(io_error)?;
+                let mut request = client
+                    .put(url)
+                    .header(reqwest::header::CONTENT_LENGTH, len)
+                    .body(reqwest::blocking::Body::new(file));
+                if let Some(content_type) = content_type {
+                    request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+                }
+                let response = request.send().map_err(http_error)?;
+                let status = response.status();
+                if !status.is_success() {
+                    return Err(http_status_error(status.as_u16()));
+                }
+                response.text().map_err(http_error)
+            })?;
+        self.closed = true;
+        self.uploaded = true;
+        self.result_json = Some(result.clone());
+        let _ = fs::remove_file(&self.temp_path);
+        Ok(result)
+    }
+
+    fn discard(&mut self) {
+        self.file.take();
+        self.closed = true;
+        let _ = fs::remove_file(&self.temp_path);
+    }
+
+    fn writable(&self) -> bool {
+        !self.closed
+    }
+
+    fn closed(&self) -> bool {
+        self.closed
+    }
+
+    fn uploaded(&self) -> bool {
+        self.uploaded
+    }
+
+    fn result_json(&self) -> Option<String> {
+        self.result_json.clone()
+    }
+}
+
+impl Drop for RustObjectWriter {
+    fn drop(&mut self) {
+        if !self.uploaded {
+            let _ = fs::remove_file(&self.temp_path);
+        }
     }
 }
 
@@ -574,6 +787,8 @@ impl RustStorageBackend {
 fn _alocals3_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RustStorageBackend>()?;
     m.add_class::<RustHttpClient>()?;
+    m.add_class::<RustObjectReader>()?;
+    m.add_class::<RustObjectWriter>()?;
     Ok(())
 }
 

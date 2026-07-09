@@ -98,32 +98,44 @@ class LocalS3Client:
         newline: str | None = None,
         content_type: str | None = None,
         cache_path: str | Path | None = None,
+        range_header: str | None = None,
     ):
         bucket, key = _parse_object_url(url)
         mode_info = _parse_mode(mode)
         if mode_info["read"]:
-            body, headers = self.get_object_bytes(bucket, key)
-            if cache_path is not None:
-                _write_cache_best_effort(cache_path, body)
+            native_reader = self._client.open_object_reader(bucket, key, range_header)
+            headers = native_reader.headers()
+            raw_reader = _S3StreamingRawReader(native_reader, cache_path=cache_path)
             if mode_info["binary"]:
-                return _S3BytesReader(body, headers=headers, bucket=bucket, key=key)
-            return _S3TextReader(
-                body.decode(encoding, errors or "strict"),
-                headers=headers,
-                bucket=bucket,
-                key=key,
+                reader = io.BufferedReader(raw_reader)
+                _set_object_attrs(reader, headers=headers, bucket=bucket, key=key)
+                return reader
+            reader = io.TextIOWrapper(
+                io.BufferedReader(raw_reader),
+                encoding=encoding,
+                errors=errors,
                 newline=newline,
             )
+            _set_object_attrs(reader, headers=headers, bucket=bucket, key=key)
+            return reader
+        if range_header is not None:
+            raise ValueError("range_header is only supported for read modes")
         if mode_info["binary"]:
-            return _S3BytesWriter(self, bucket, key, content_type=content_type, cache_path=cache_path)
-        return _S3TextWriter(
-            self,
-            bucket,
-            key,
+            native_writer = self._client.open_object_writer(bucket, key, content_type)
+            return _S3StreamingBytesWriter(
+                native_writer,
+                bucket=bucket,
+                key=key,
+                cache_path=cache_path,
+            )
+        native_writer = self._client.open_object_writer(bucket, key, content_type)
+        return _S3StreamingTextWriter(
+            native_writer,
+            bucket=bucket,
+            key=key,
             encoding=encoding,
             errors=errors,
             newline=newline,
-            content_type=content_type,
             cache_path=cache_path,
         )
 
@@ -221,6 +233,7 @@ class LocalS3ClientAsync:
         newline: str | None = None,
         content_type: str | None = None,
         cache_path: str | Path | None = None,
+        range_header: str | None = None,
     ):
         return await asyncio.to_thread(
             self._sync.open,
@@ -231,6 +244,7 @@ class LocalS3ClientAsync:
             newline=newline,
             content_type=content_type,
             cache_path=cache_path,
+            range_header=range_header,
         )
 
     async def close(self) -> None:
@@ -272,6 +286,183 @@ class _S3TextReader(_S3ObjectMixin, io.StringIO):
         self.headers = headers
         self.bucket = bucket
         self.key = key
+
+
+class _S3StreamingRawReader(io.RawIOBase):
+    def __init__(self, native_reader, *, cache_path: str | Path | None) -> None:
+        super().__init__()
+        self._native_reader = native_reader
+        self._cache = _open_cache_writer_best_effort(cache_path)
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        if self.closed:
+            raise ValueError("I/O operation on closed S3 reader")
+        data = self._native_reader.read(len(buffer))
+        if not data:
+            return 0
+        buffer[: len(data)] = data
+        if self._cache is not None:
+            try:
+                self._cache.write(data)
+            except OSError:
+                self._close_cache()
+        return len(data)
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                self._native_reader.close()
+            finally:
+                self._close_cache()
+        super().close()
+
+    def _close_cache(self) -> None:
+        if self._cache is not None:
+            try:
+                self._cache.close()
+            except OSError:
+                pass
+            self._cache = None
+
+
+class _S3StreamingBytesWriter:
+    def __init__(
+        self,
+        native_writer,
+        *,
+        bucket: str,
+        key: str,
+        cache_path: str | Path | None,
+    ) -> None:
+        self._native_writer = native_writer
+        self.bucket = bucket
+        self.key = key
+        self.cache_path = cache_path
+        self.result: dict | None = None
+        self.closed = False
+        self._uploaded = False
+        self._cache = _open_cache_writer_best_effort(cache_path)
+
+    def writable(self) -> bool:
+        return not self.closed
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        if self.closed:
+            raise ValueError("I/O operation on closed S3 writer")
+        body = bytes(data)
+        written = self._native_writer.write(body)
+        if self._cache is not None:
+            try:
+                self._cache.write(body)
+            except OSError:
+                self._close_cache()
+        return written
+
+    def flush(self) -> None:
+        if self.closed:
+            raise ValueError("I/O operation on closed S3 writer")
+        self._native_writer.flush()
+        if self._cache is not None:
+            try:
+                self._cache.flush()
+            except OSError:
+                self._close_cache()
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        try:
+            result_json = self._native_writer.close()
+            self.result = _loads(result_json) if result_json else None
+            self._uploaded = True
+        finally:
+            self.closed = True
+            self._close_cache()
+
+    def discard(self) -> None:
+        if not self.closed:
+            self._native_writer.discard()
+            self.closed = True
+            self._close_cache()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            self.discard()
+
+    def _close_cache(self) -> None:
+        if self._cache is not None:
+            try:
+                self._cache.close()
+            except OSError:
+                pass
+            self._cache = None
+
+
+class _S3StreamingTextWriter:
+    def __init__(
+        self,
+        native_writer,
+        *,
+        bucket: str,
+        key: str,
+        encoding: str,
+        errors: str | None,
+        newline: str | None,
+        cache_path: str | Path | None,
+    ) -> None:
+        self._binary = _S3StreamingBytesWriter(
+            native_writer,
+            bucket=bucket,
+            key=key,
+            cache_path=cache_path,
+        )
+        self.bucket = bucket
+        self.key = key
+        self.encoding = encoding
+        self.errors = errors or "strict"
+        self.newline = newline
+        self.result: dict | None = None
+
+    @property
+    def closed(self) -> bool:
+        return self._binary.closed
+
+    def writable(self) -> bool:
+        return self._binary.writable()
+
+    def write(self, text: str) -> int:
+        if not isinstance(text, str):
+            raise TypeError("write() argument must be str, not bytes")
+        if self.newline not in (None, ""):
+            text = text.replace("\n", self.newline)
+        data = text.encode(self.encoding, self.errors)
+        self._binary.write(data)
+        return len(text)
+
+    def flush(self) -> None:
+        self._binary.flush()
+
+    def close(self) -> None:
+        self._binary.close()
+        self.result = self._binary.result
+
+    def discard(self) -> None:
+        self._binary.discard()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self._binary.__exit__(exc_type, exc_value, traceback)
+        self.result = self._binary.result
 
 
 class _S3BytesWriter(io.BytesIO):
@@ -411,6 +602,24 @@ def _write_cache_best_effort(path: str | Path, body: bytes) -> None:
         cache_path.write_bytes(body)
     except OSError:
         pass
+
+
+def _open_cache_writer_best_effort(path: str | Path | None):
+    if path is None:
+        return None
+    try:
+        cache_path = Path(path)
+        if cache_path.parent != Path(""):
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+        return cache_path.open("wb")
+    except OSError:
+        return None
+
+
+def _set_object_attrs(file_obj, *, headers: dict, bucket: str, key: str) -> None:
+    file_obj.headers = headers
+    file_obj.bucket = bucket
+    file_obj.key = key
 
 
 def _build_parser() -> argparse.ArgumentParser:

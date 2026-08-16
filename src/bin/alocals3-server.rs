@@ -620,11 +620,12 @@ async fn head_object(
     AxumPath((bucket, key)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    object_response(
-        state.storage.get_object(&bucket, &key).await?,
-        &headers,
-        false,
-    )
+    let info = state
+        .storage
+        .get_object_info(&bucket, &key)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Object not found"))?;
+    object_head_response(info, &headers)
 }
 
 async fn delete_object(
@@ -1560,6 +1561,53 @@ fn object_response(
     }
 }
 
+fn object_head_response(info: ObjectInfo, headers: &HeaderMap) -> ApiResult<Response> {
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{}\"", info.etag)).unwrap(),
+    );
+    response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response_headers.insert(
+        header::LAST_MODIFIED,
+        HeaderValue::from_str(&http_date(&info.updated_at))
+            .unwrap_or_else(|_| HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT")),
+    );
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&info.content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+
+    if header_str(headers, header::IF_NONE_MATCH.as_str())
+        .map(|value| etag_matches(value, &info.etag))
+        .unwrap_or(false)
+    {
+        return Ok((StatusCode::NOT_MODIFIED, response_headers).into_response());
+    }
+
+    let body_len = usize::try_from(info.size.max(0))
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Invalid object size"))?;
+    if let Some(range_header) = header_str(headers, header::RANGE.as_str()) {
+        let (start, end) = parse_range(range_header, body_len)?;
+        response_headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{body_len}")).unwrap(),
+        );
+        response_headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&(end - start + 1).to_string()).unwrap(),
+        );
+        return Ok((StatusCode::PARTIAL_CONTENT, response_headers).into_response());
+    }
+
+    response_headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&body_len.to_string()).unwrap(),
+    );
+    Ok((StatusCode::OK, response_headers).into_response())
+}
+
 fn validate_bucket(bucket: &str) -> ApiResult<()> {
     if bucket.is_empty()
         || bucket.contains('/')
@@ -1933,6 +1981,44 @@ mod tests {
                 .body,
             b"shared"
         );
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn head_response_uses_database_metadata_without_reading_the_blob() {
+        let (storage, root) = test_storage().await;
+        storage
+            .put_object(
+                "test-bucket",
+                "large.glb",
+                b"payload",
+                Some("model/gltf-binary"),
+            )
+            .await
+            .unwrap();
+        let bucket = storage.bucket_row("test-bucket").await.unwrap();
+        let row = storage.object_row(bucket.id, "large.glb").await.unwrap();
+        tokio::fs::remove_file(storage.objects_root().join(row.file_path))
+            .await
+            .unwrap();
+
+        let info = storage
+            .get_object_info("test-bucket", "large.glb")
+            .await
+            .unwrap()
+            .unwrap();
+        let response = object_head_response(info, &HeaderMap::new()).unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "7");
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "model/gltf-binary"
+        );
+        assert!(storage
+            .get_object("test-bucket", "large.glb")
+            .await
+            .is_err());
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

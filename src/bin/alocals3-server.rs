@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -82,7 +82,6 @@ struct GarbageCollector {
     grace: Duration,
     start_delay: Duration,
     running: AtomicBool,
-    notify: Notify,
 }
 
 #[derive(Default)]
@@ -216,17 +215,12 @@ impl GarbageCollector {
             grace,
             start_delay,
             running: AtomicBool::new(false),
-            notify: Notify::new(),
         });
         let task_gc = Arc::clone(&gc);
         tokio::spawn(async move {
             task_gc.run_loop().await;
         });
         gc
-    }
-
-    fn trigger(&self) {
-        self.notify.notify_one();
     }
 
     async fn run_loop(self: Arc<Self>) {
@@ -239,11 +233,33 @@ impl GarbageCollector {
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         interval.tick().await;
         loop {
-            tokio::select! {
-                _ = interval.tick() => self.run_once("periodic").await,
-                _ = self.notify.notified() => self.run_once("triggered").await,
-            }
+            interval.tick().await;
+            self.run_once("periodic").await;
         }
+    }
+
+    fn reclaim_path(self: &Arc<Self>, relative_path: String) {
+        let gc = Arc::clone(self);
+        tokio::spawn(async move {
+            // Keep the same grace window as the full GC so an in-flight GET that
+            // resolved the previous database row can still open the old blob.
+            if !gc.grace.is_zero() {
+                tokio::time::sleep(gc.grace).await;
+            }
+            match gc.storage.reclaim_unreferenced_path(&relative_path).await {
+                Ok(Some(bytes)) => tracing::info!(
+                    file_path = %relative_path,
+                    orphan_bytes_deleted = bytes,
+                    "targeted gc completed"
+                ),
+                Ok(None) => tracing::debug!(file_path = %relative_path, "targeted gc skipped"),
+                Err(err) => tracing::warn!(
+                    file_path = %relative_path,
+                    error = %err.detail,
+                    "targeted gc failed"
+                ),
+            }
+        });
     }
 
     async fn run_once(&self, reason: &'static str) {
@@ -564,14 +580,12 @@ async fn put_object(
     }
 
     let content_type = header_str(&headers, header::CONTENT_TYPE.as_str()).map(str::to_string);
-    let (info, created) = state
+    let (info, created, retired_path) = state
         .storage
         .put_object(&bucket, &key, &body, content_type.as_deref())
         .await?;
-    if !created {
-        if let Some(gc) = &state.gc {
-            gc.trigger();
-        }
+    if let (Some(gc), Some(path)) = (&state.gc, retired_path) {
+        gc.reclaim_path(path);
     }
     let mut response = (
         if created {
@@ -617,9 +631,9 @@ async fn delete_object(
     State(state): State<AppState>,
     AxumPath((bucket, key)): AxumPath<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    state.storage.delete_object(&bucket, &key).await?;
+    let retired_path = state.storage.delete_object(&bucket, &key).await?;
     if let Some(gc) = &state.gc {
-        gc.trigger();
+        gc.reclaim_path(retired_path);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -841,10 +855,14 @@ impl Storage {
         key: &str,
         body: &[u8],
         content_type: Option<&str>,
-    ) -> ApiResult<(ObjectInfo, bool)> {
+    ) -> ApiResult<(ObjectInfo, bool, Option<String>)> {
         validate_bucket(bucket)?;
         let normalized_key = normalize_key(key)?;
         let bucket_row = self.bucket_row(bucket).await?;
+        let previous_path = self
+            .object_row_optional(bucket_row.id, &normalized_key)
+            .await?
+            .map(|row| row.file_path);
         let etag = format!("{:x}", md5::compute(body));
         let digest = hex_sha256(body);
         let relative_path = format!("{}/{}/{}", &digest[..2], &digest[2..4], digest);
@@ -871,7 +889,8 @@ impl Storage {
                 )
                 .await?;
             let row = self.object_row(bucket_row.id, &normalized_key).await?;
-            Ok((row.info(bucket), created))
+            let retired_path = previous_path.filter(|path| path != &relative_path);
+            Ok((row.info(bucket), created, retired_path))
         }
         .await;
         self.unregister_active_write(&relative_path).await;
@@ -902,10 +921,11 @@ impl Storage {
             .map(|row| row.info(bucket)))
     }
 
-    async fn delete_object(&self, bucket: &str, key: &str) -> ApiResult<()> {
+    async fn delete_object(&self, bucket: &str, key: &str) -> ApiResult<String> {
         validate_bucket(bucket)?;
         let normalized_key = normalize_key(key)?;
         let bucket_row = self.bucket_row(bucket).await?;
+        let previous = self.object_row(bucket_row.id, &normalized_key).await?;
         let changed = match self {
             Self::Sqlite { pool, .. } => {
                 sqlx::query("DELETE FROM objects WHERE bucket_id = ?1 AND key = ?2")
@@ -927,7 +947,19 @@ impl Storage {
         if changed == 0 {
             return Err(ApiError::new(StatusCode::NOT_FOUND, "Object not found"));
         }
-        Ok(())
+        Ok(previous.file_path)
+    }
+
+    async fn reclaim_unreferenced_path(&self, relative_path: &str) -> ApiResult<Option<u64>> {
+        if !is_safe_storage_relative_path(relative_path) {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Unsafe object file_path",
+            ));
+        }
+        let path = self.objects_root().join(relative_path);
+        self.remove_orphan_file_if_still_unreferenced(&path, relative_path, Duration::ZERO)
+            .await
     }
 
     async fn garbage_collect(&self, grace: Duration) -> ApiResult<GcReport> {
@@ -1421,6 +1453,9 @@ async fn init_sqlite(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_bucket_key ON objects (bucket_id, key)")
         .execute(pool)
         .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_file_path ON objects (file_path)")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -1454,6 +1489,9 @@ async fn init_pg(pool: &PgPool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_bucket_key ON objects (bucket_id, key)")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_file_path ON objects (file_path)")
         .execute(pool)
         .await?;
     Ok(())
@@ -1811,5 +1849,90 @@ impl From<std::io::Error> for ApiError {
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("I/O error: {err}"),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_storage() -> (Storage, PathBuf) {
+        let root = std::env::temp_dir().join(format!("alocals3-targeted-gc-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let database_url = format!("sqlite:///{}", root.join("alocals3.db").display());
+        let storage = Storage::connect(&database_url, root.join("storage"))
+            .await
+            .unwrap();
+        storage.create_bucket("test-bucket").await.unwrap();
+        (storage, root)
+    }
+
+    #[tokio::test]
+    async fn targeted_gc_reclaims_only_the_replaced_blob() {
+        let (storage, root) = test_storage().await;
+        let (_, created, _) = storage
+            .put_object("test-bucket", "item", b"old", None)
+            .await
+            .unwrap();
+        assert!(created);
+
+        let (_, created, retired_path) = storage
+            .put_object("test-bucket", "item", b"new", None)
+            .await
+            .unwrap();
+        assert!(!created);
+        let retired_path = retired_path.expect("overwriting different content must retire a blob");
+        assert!(storage.objects_root().join(&retired_path).exists());
+
+        let deleted = storage
+            .reclaim_unreferenced_path(&retired_path)
+            .await
+            .unwrap();
+        assert_eq!(deleted, Some(3));
+        assert!(!storage.objects_root().join(&retired_path).exists());
+        assert_eq!(
+            storage
+                .get_object("test-bucket", "item")
+                .await
+                .unwrap()
+                .body,
+            b"new"
+        );
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn targeted_gc_preserves_a_blob_shared_by_another_key() {
+        let (storage, root) = test_storage().await;
+        storage
+            .put_object("test-bucket", "first", b"shared", None)
+            .await
+            .unwrap();
+        storage
+            .put_object("test-bucket", "second", b"shared", None)
+            .await
+            .unwrap();
+
+        let (_, _, retired_path) = storage
+            .put_object("test-bucket", "first", b"replacement", None)
+            .await
+            .unwrap();
+        let retired_path = retired_path.expect("the first key must retire its old blob");
+        let deleted = storage
+            .reclaim_unreferenced_path(&retired_path)
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, None);
+        assert!(storage.objects_root().join(&retired_path).exists());
+        assert_eq!(
+            storage
+                .get_object("test-bucket", "second")
+                .await
+                .unwrap()
+                .body,
+            b"shared"
+        );
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

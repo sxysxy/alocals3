@@ -49,6 +49,29 @@ The official maturin container image uses `maturin` as its entrypoint, so the sc
 
 The Linux container build defaults to `--network host`. This avoids failures when Cargo inherits a proxy such as `HTTPS_PROXY=http://127.0.0.1:...`; with bridge networking, `127.0.0.1` points at the container instead of the host.
 
+### Linux aarch64 on an x86_64 host
+
+To build both the aarch64 server and wheel on an x86_64 host without installing a
+host cross-compiler, use Docker's ARM64 platform emulation:
+
+```bash
+scripts/build-linux-aarch64-on-x64.sh
+```
+
+The script runs the complete Rust and maturin build inside a
+`--platform linux/arm64` container. Docker must have Linux ARM64 emulation
+available (Docker Desktop provides it; a Linux Docker Engine may require binfmt/QEMU
+to be registered). Artifacts are written to `dist/`, and the aarch64 server is
+bundled into the wheel.
+
+Useful overrides:
+
+```bash
+OUT_DIR=dist-aarch64 scripts/build-linux-aarch64-on-x64.sh
+CONTAINER_NETWORK=bridge scripts/build-linux-aarch64-on-x64.sh
+MATURIN_IMAGE=ghcr.io/pyo3/maturin:v1.14.1 scripts/build-linux-aarch64-on-x64.sh
+```
+
 ## Windows
 
 Run from PowerShell on Windows 10 or newer:

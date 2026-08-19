@@ -12,4 +12,5 @@ alocals3.db-wal
 data
 examples/.tmp
 alocals3/bin/alocals3-server*
+alocals3/bin/alocals3-migrate2pg*
 .DS_Store

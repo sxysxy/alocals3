@@ -173,6 +173,10 @@ with ALocalS3Client("http://127.0.0.1:8000", disable_proxy=True) as client:
     client.create_bucket("demo")
     info = client.put_object("demo", "logs/数据.txt", Path("data.txt"))
     print(info["etag"])
+    copied = client.copy_object(
+        "demo", "logs/数据.txt", "demo", "logs/copied.txt",
+        metadata={"foo": "bar"},
+    )
 
     data, headers = client.get_object_range("demo", "logs/数据.txt", "bytes=0-99")
     print(len(data), headers.get("content-range"))
@@ -203,9 +207,24 @@ CLI：
 ```bash
 python -m alocals3.client --endpoint http://127.0.0.1:8000 CREATE_BUCKET demo
 python -m alocals3.client --endpoint http://127.0.0.1:8000 PUT demo file.bin ./file.bin
+python -m alocals3.client --endpoint http://127.0.0.1:8000 COPY demo file.bin demo copy.bin --metadata foo=bar
 python -m alocals3.client --endpoint http://127.0.0.1:8000 GET demo file.bin ./copy.bin
 python -m alocals3.client --endpoint http://127.0.0.1:8000 LIST_OBJECTS_V2 demo --prefix logs/ --delimiter /
 ```
+
+也可以通过兼容 S3 的 `PUT` + `x-amz-copy-source` 调用 `CopyObject`。复制只会新增一条指向源内容寻址 blob 的数据库引用，不复制对象字节，因此相对于对象大小是 O(1)。服务端会持久化 `x-amz-meta-*` 用户元数据；复制时默认使用 `COPY`，传 `x-amz-metadata-directive: REPLACE` 可替换元数据。
+
+## 从 SQLite 迁移到 PostgreSQL
+
+先停止写入或制作 SQLite 快照，然后执行：
+
+```bash
+alocals3-migrate2pg \
+  --source sqlite:///./alocals3.db \
+  --target postgresql://user:password@127.0.0.1:5432/alocals3
+```
+
+该命令只迁移数据库元数据。请继续使用相同的 `--storage-root`（或单独迁移存储目录），因为对象 blob 由数据库中的相对内容寻址路径引用。迁移可重复执行，所有 bucket/object 数据行会在一个 PostgreSQL 事务中提交。
 
 设置 `disable_proxy=True` 或传 `--disable-proxy` 可以忽略 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 等代理环境变量。
 

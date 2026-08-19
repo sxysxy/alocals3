@@ -13,6 +13,11 @@ name = "alocals3-server"
 path = "src/bin/alocals3-server.rs"
 required-features = ["server"]
 
+[[bin]]
+name = "alocals3-migrate2pg"
+path = "src/bin/alocals3-migrate2pg.rs"
+required-features = ["server"]
+
 [dependencies]
 anyhow = { version = "1", optional = true }
 axum = { version = "0.7", optional = true }

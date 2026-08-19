@@ -53,8 +53,15 @@ class ALocalS3Client:
     ) -> dict:
         return _loads(self._client.list_objects_v2_json(bucket, prefix, delimiter, max_keys, continuation_token))
 
-    def put_object(self, bucket: str, key: str, file_path: Path, content_type: str | None = None) -> dict:
-        return _loads(self._client.put_object_json(bucket, key, str(file_path), content_type))
+    def put_object(
+        self,
+        bucket: str,
+        key: str,
+        file_path: Path,
+        content_type: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> dict:
+        return _loads(self._client.put_object_json(bucket, key, str(file_path), content_type, metadata))
 
     def put_object_bytes(
         self,
@@ -62,8 +69,9 @@ class ALocalS3Client:
         key: str,
         body: bytes | bytearray | memoryview,
         content_type: str | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> dict:
-        return _loads(self._client.put_object_bytes_json(bucket, key, bytes(body), content_type))
+        return _loads(self._client.put_object_bytes_json(bucket, key, bytes(body), content_type, metadata))
 
     def get_object(self, bucket: str, key: str, output_path: Path) -> None:
         self._client.get_object_to_file(bucket, key, str(output_path), None)
@@ -87,6 +95,30 @@ class ALocalS3Client:
 
     def delete_object(self, bucket: str, key: str) -> None:
         self._client.delete_object(bucket, key)
+
+    def copy_object(
+        self,
+        source_bucket: str,
+        source_key: str,
+        destination_bucket: str,
+        destination_key: str,
+        *,
+        metadata: dict[str, str] | None = None,
+        metadata_directive: str | None = None,
+        content_type: str | None = None,
+    ) -> dict:
+        """Copy an object in O(1) by sharing its content-addressed blob."""
+        return _loads(
+            self._client.copy_object_json(
+                source_bucket,
+                source_key,
+                destination_bucket,
+                destination_key,
+                metadata,
+                metadata_directive,
+                content_type,
+            )
+        )
 
     def open(
         self,
@@ -190,8 +222,15 @@ class ALocalS3ClientAsync:
             continuation_token,
         )
 
-    async def put_object(self, bucket: str, key: str, file_path: Path, content_type: str | None = None) -> dict:
-        return await asyncio.to_thread(self._sync.put_object, bucket, key, file_path, content_type)
+    async def put_object(
+        self,
+        bucket: str,
+        key: str,
+        file_path: Path,
+        content_type: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> dict:
+        return await asyncio.to_thread(self._sync.put_object, bucket, key, file_path, content_type, metadata)
 
     async def put_object_bytes(
         self,
@@ -199,8 +238,9 @@ class ALocalS3ClientAsync:
         key: str,
         body: bytes | bytearray | memoryview,
         content_type: str | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> dict:
-        return await asyncio.to_thread(self._sync.put_object_bytes, bucket, key, body, content_type)
+        return await asyncio.to_thread(self._sync.put_object_bytes, bucket, key, body, content_type, metadata)
 
     async def get_object(self, bucket: str, key: str, output_path: Path) -> None:
         await asyncio.to_thread(self._sync.get_object, bucket, key, output_path)
@@ -222,6 +262,28 @@ class ALocalS3ClientAsync:
 
     async def delete_object(self, bucket: str, key: str) -> None:
         await asyncio.to_thread(self._sync.delete_object, bucket, key)
+
+    async def copy_object(
+        self,
+        source_bucket: str,
+        source_key: str,
+        destination_bucket: str,
+        destination_key: str,
+        *,
+        metadata: dict[str, str] | None = None,
+        metadata_directive: str | None = None,
+        content_type: str | None = None,
+    ) -> dict:
+        return await asyncio.to_thread(
+            self._sync.copy_object,
+            source_bucket,
+            source_key,
+            destination_bucket,
+            destination_key,
+            metadata=metadata,
+            metadata_directive=metadata_directive,
+            content_type=content_type,
+        )
 
     def open(
         self,
@@ -816,6 +878,27 @@ def _build_parser() -> argparse.ArgumentParser:
     put_parser.add_argument("key")
     put_parser.add_argument("file", help="Local file path")
     put_parser.add_argument("--content-type", default=None)
+    put_parser.add_argument(
+        "--metadata",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="User metadata; may be repeated",
+    )
+
+    copy_parser = subparsers.add_parser("COPY", aliases=["cp"], help="Copy object in O(1)")
+    copy_parser.add_argument("source_bucket")
+    copy_parser.add_argument("source_key")
+    copy_parser.add_argument("destination_bucket")
+    copy_parser.add_argument("destination_key")
+    copy_parser.add_argument(
+        "--metadata",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Replacement user metadata; may be repeated",
+    )
+    copy_parser.add_argument("--content-type", default=None)
 
     get_parser = subparsers.add_parser("GET", aliases=["get"], help="Download object")
     get_parser.add_argument("bucket")
@@ -841,6 +924,7 @@ def main(argv: list[str] | None = None) -> int:
         "rb": "DELETE_BUCKET",
         "lso": "LIST_OBJECTS",
         "put": "PUT",
+        "cp": "COPY",
         "get": "GET",
         "rm": "DELETE",
     }.get(args.command, args.command)
@@ -861,7 +945,19 @@ def main(argv: list[str] | None = None) -> int:
             result = client.list_objects_v2(args.bucket, args.prefix, args.delimiter, args.max_keys, args.continuation_token)
             print(json.dumps(result, ensure_ascii=False, indent=2))
         elif command == "PUT":
-            print(json.dumps(client.put_object(args.bucket, args.key, Path(args.file), args.content_type), ensure_ascii=False, indent=2))
+            metadata = dict(item.split("=", 1) for item in args.metadata)
+            print(json.dumps(client.put_object(args.bucket, args.key, Path(args.file), args.content_type, metadata or None), ensure_ascii=False, indent=2))
+        elif command == "COPY":
+            metadata = dict(item.split("=", 1) for item in args.metadata)
+            result = client.copy_object(
+                args.source_bucket,
+                args.source_key,
+                args.destination_bucket,
+                args.destination_key,
+                metadata=metadata or None,
+                content_type=args.content_type,
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
         elif command == "GET":
             headers = client.get_object_to_file(args.bucket, args.key, Path(args.output), args.range_header)
             content_range = headers.get("content-range")

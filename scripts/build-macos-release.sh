@@ -27,16 +27,23 @@ PYO3_NO_PYTHON=1 cargo build \
   --no-default-features \
   --features server,server-binary \
   --bin alocals3-server \
+  --bin alocals3-migrate2pg \
   --target "$TARGET"
 
 SERVER_SRC="target/$TARGET/release/alocals3-server"
 SERVER_DST="$OUT_DIR/alocals3-server"
+MIGRATE_SRC="target/$TARGET/release/alocals3-migrate2pg"
+MIGRATE_DST="$OUT_DIR/alocals3-migrate2pg"
 cp "$SERVER_SRC" "$SERVER_DST"
+cp "$MIGRATE_SRC" "$MIGRATE_DST"
 chmod +x "$SERVER_DST"
+chmod +x "$MIGRATE_DST"
 rm -rf "$ROOT_DIR/alocals3/bin"
 mkdir -p "$ROOT_DIR/alocals3/bin"
 cp "$SERVER_SRC" "$ROOT_DIR/alocals3/bin/alocals3-server"
+cp "$MIGRATE_SRC" "$ROOT_DIR/alocals3/bin/alocals3-migrate2pg"
 chmod +x "$ROOT_DIR/alocals3/bin/alocals3-server"
+chmod +x "$ROOT_DIR/alocals3/bin/alocals3-migrate2pg"
 
 echo "==> Building macOS cp312 abi3 wheel for $TARGET"
 "$PYTHON" -m pip install --upgrade "maturin>=1.7,<2"
@@ -49,6 +56,6 @@ echo "==> Building macOS cp312 abi3 wheel for $TARGET"
   --out "$OUT_DIR"
 
 echo "==> Artifact metadata"
-file "$SERVER_DST"
+file "$SERVER_DST" "$MIGRATE_DST"
 otool -l "$SERVER_DST" | awk '/LC_BUILD_VERSION/{show=1} show{print} /sdk/{if(show){show=0}}'
-ls -lh "$SERVER_DST" "$OUT_DIR"/*.whl
+ls -lh "$SERVER_DST" "$MIGRATE_DST" "$OUT_DIR"/*.whl

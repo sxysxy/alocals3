@@ -25,6 +25,7 @@ Defaults:
 
 - server target: `x86_64-unknown-linux-musl`
 - server output: `dist/alocals3-server`
+- migration CLI output: `dist/alocals3-migrate2pg`
 - wheel builder: `ghcr.io/pyo3/maturin:latest`
 - wheel compatibility tag: `manylinux_2_28`
 - container runtime: `docker` if available, otherwise `podman`
@@ -83,6 +84,7 @@ Run from PowerShell on Windows 10 or newer:
 Defaults:
 
 - server output: `dist\alocals3-server.exe`
+- migration CLI output: `dist\alocals3-migrate2pg.exe`
 - Python resolver: `py -3.12`
 
 Useful overrides:
@@ -106,6 +108,7 @@ Defaults:
 - target: `aarch64-apple-darwin`
 - deployment target: `MACOSX_DEPLOYMENT_TARGET=11.0`
 - server output: `dist/alocals3-server`
+- migration CLI output: `dist/alocals3-migrate2pg`
 
 Useful overrides:
 

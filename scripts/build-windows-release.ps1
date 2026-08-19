@@ -25,7 +25,9 @@ $CargoArgs = @(
     "--features",
     "server,server-binary",
     "--bin",
-    "alocals3-server"
+    "alocals3-server",
+    "--bin",
+    "alocals3-migrate2pg"
 )
 if ($Target) {
     $CargoArgs += @("--target", $Target)
@@ -42,13 +44,17 @@ if ($Target) {
     $ServerSrc = "target\release\alocals3-server.exe"
 }
 $ServerDst = Join-Path $OutDir "alocals3-server.exe"
+$MigrateSrc = if ($Target) { Join-Path "target" (Join-Path $Target "release\alocals3-migrate2pg.exe") } else { "target\release\alocals3-migrate2pg.exe" }
+$MigrateDst = Join-Path $OutDir "alocals3-migrate2pg.exe"
 Copy-Item -Force $ServerSrc $ServerDst
+Copy-Item -Force $MigrateSrc $MigrateDst
 $PackageBinDir = Join-Path $RootDir "alocals3\bin"
 if (Test-Path $PackageBinDir) {
     Remove-Item -Recurse -Force $PackageBinDir
 }
 New-Item -ItemType Directory -Force -Path $PackageBinDir | Out-Null
 Copy-Item -Force $ServerSrc (Join-Path $PackageBinDir "alocals3-server.exe")
+Copy-Item -Force $MigrateSrc (Join-Path $PackageBinDir "alocals3-migrate2pg.exe")
 
 Write-Host "==> Building Windows cp312 abi3 wheel"
 & $Python312 -m pip install --upgrade "maturin>=1.7,<2"
@@ -61,4 +67,5 @@ Write-Host "==> Building Windows cp312 abi3 wheel"
 
 Write-Host "==> Artifacts"
 Get-ChildItem $OutDir -Filter "alocals3-server.exe"
+Get-ChildItem $OutDir -Filter "alocals3-migrate2pg.exe"
 Get-ChildItem $OutDir -Filter "*.whl"

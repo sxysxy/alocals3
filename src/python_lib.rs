@@ -6,6 +6,7 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyModule};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -132,13 +133,14 @@ impl RustHttpClient {
         )
     }
 
-    #[pyo3(signature = (bucket, key, file_path, content_type=None))]
+    #[pyo3(signature = (bucket, key, file_path, content_type=None, metadata=None))]
     fn put_object_json(
         &self,
         bucket: &str,
         key: &str,
         file_path: &str,
         content_type: Option<&str>,
+        metadata: Option<HashMap<String, String>>,
     ) -> PyResult<String> {
         let body = fs::read(file_path).map_err(io_error)?;
         let mut request = self
@@ -148,16 +150,22 @@ impl RustHttpClient {
         if let Some(content_type) = content_type {
             request = request.header(reqwest::header::CONTENT_TYPE, content_type);
         }
+        if let Some(metadata) = metadata {
+            for (key, value) in metadata {
+                request = request.header(format!("x-amz-meta-{key}"), value);
+            }
+        }
         self.request_json(request)
     }
 
-    #[pyo3(signature = (bucket, key, body, content_type=None))]
+    #[pyo3(signature = (bucket, key, body, content_type=None, metadata=None))]
     fn put_object_bytes_json(
         &self,
         bucket: &str,
         key: &str,
         body: &[u8],
         content_type: Option<&str>,
+        metadata: Option<HashMap<String, String>>,
     ) -> PyResult<String> {
         let mut request = self
             .client
@@ -165,6 +173,11 @@ impl RustHttpClient {
             .body(body.to_vec());
         if let Some(content_type) = content_type {
             request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+        }
+        if let Some(metadata) = metadata {
+            for (key, value) in metadata {
+                request = request.header(format!("x-amz-meta-{key}"), value);
+            }
         }
         self.request_json(request)
     }
@@ -296,6 +309,44 @@ impl RustHttpClient {
 
     fn delete_object(&self, bucket: &str, key: &str) -> PyResult<()> {
         self.request_empty(self.client.delete(self.url(&object_path(bucket, key))))
+    }
+
+    #[pyo3(signature = (source_bucket, source_key, destination_bucket, destination_key, metadata=None, metadata_directive=None, content_type=None))]
+    fn copy_object_json(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        destination_bucket: &str,
+        destination_key: &str,
+        metadata: Option<HashMap<String, String>>,
+        metadata_directive: Option<&str>,
+        content_type: Option<&str>,
+    ) -> PyResult<String> {
+        let source = format!(
+            "/{}/{}",
+            encode_segment(source_bucket),
+            encode_key(source_key)
+        );
+        let mut request = self
+            .client
+            .put(self.url(&object_path(destination_bucket, destination_key)))
+            .query(&[("output", "json")])
+            .header("x-amz-copy-source", source);
+        let directive = metadata_directive.unwrap_or(if metadata.is_some() || content_type.is_some() {
+            "REPLACE"
+        } else {
+            "COPY"
+        });
+        request = request.header("x-amz-metadata-directive", directive);
+        if let Some(content_type) = content_type {
+            request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+        }
+        if let Some(metadata) = metadata {
+            for (key, value) in metadata {
+                request = request.header(format!("x-amz-meta-{key}"), value);
+            }
+        }
+        self.request_json(request)
     }
 }
 

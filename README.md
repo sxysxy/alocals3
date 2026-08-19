@@ -175,6 +175,10 @@ with ALocalS3Client("http://127.0.0.1:8000", disable_proxy=True) as client:
     client.create_bucket("demo")
     info = client.put_object("demo", "logs/数据.txt", Path("data.txt"))
     print(info["etag"])
+    copied = client.copy_object(
+        "demo", "logs/数据.txt", "demo", "logs/copied.txt",
+        metadata={"foo": "bar"},
+    )
 
     data, headers = client.get_object_range("demo", "logs/数据.txt", "bytes=0-99")
     print(len(data), headers.get("content-range"))
@@ -205,9 +209,31 @@ CLI:
 ```bash
 python -m alocals3.client --endpoint http://127.0.0.1:8000 CREATE_BUCKET demo
 python -m alocals3.client --endpoint http://127.0.0.1:8000 PUT demo file.bin ./file.bin
+python -m alocals3.client --endpoint http://127.0.0.1:8000 COPY demo file.bin demo copy.bin --metadata foo=bar
 python -m alocals3.client --endpoint http://127.0.0.1:8000 GET demo file.bin ./copy.bin
 python -m alocals3.client --endpoint http://127.0.0.1:8000 LIST_OBJECTS_V2 demo --prefix logs/ --delimiter /
 ```
+
+`CopyObject` is also available through the S3-compatible `PUT` form using
+`x-amz-copy-source`. It reuses the source content-addressed blob, so it performs
+no object-byte copy and remains O(1) with respect to object size. User metadata
+headers (`x-amz-meta-*`) are persisted; use `x-amz-metadata-directive: REPLACE`
+to replace metadata during a copy (the default is `COPY`).
+
+## Migrate SQLite to PostgreSQL
+
+Stop writers or take a SQLite snapshot first, then run:
+
+```bash
+alocals3-migrate2pg \
+  --source sqlite:///./alocals3.db \
+  --target postgresql://user:password@127.0.0.1:5432/alocals3
+```
+
+The command migrates metadata only. Keep the same `--storage-root` (or move the
+storage directory separately), because object blobs are referenced by relative
+content-addressed paths. The migration is idempotent and commits all migrated
+bucket/object rows in one PostgreSQL transaction.
 
 Set `disable_proxy=True` or pass `--disable-proxy` to ignore proxy environment variables such as `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`.
 

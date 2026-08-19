@@ -27,16 +27,23 @@ PYO3_NO_PYTHON=1 cargo build \
   --no-default-features \
   --features server,server-binary \
   --bin alocals3-server \
+  --bin alocals3-migrate2pg \
   --target "$TARGET"
 
 SERVER_SRC="target/$TARGET/release/alocals3-server"
 SERVER_DST="$OUT_DIR/alocals3-server"
+MIGRATE_SRC="target/$TARGET/release/alocals3-migrate2pg"
+MIGRATE_DST="$OUT_DIR/alocals3-migrate2pg"
 cp "$SERVER_SRC" "$SERVER_DST"
+cp "$MIGRATE_SRC" "$MIGRATE_DST"
 chmod +x "$SERVER_DST"
+chmod +x "$MIGRATE_DST"
 rm -rf "$ROOT_DIR/alocals3/bin"
 mkdir -p "$ROOT_DIR/alocals3/bin"
 cp "$SERVER_SRC" "$ROOT_DIR/alocals3/bin/alocals3-server"
+cp "$MIGRATE_SRC" "$ROOT_DIR/alocals3/bin/alocals3-migrate2pg"
 chmod +x "$ROOT_DIR/alocals3/bin/alocals3-server"
+chmod +x "$ROOT_DIR/alocals3/bin/alocals3-migrate2pg"
 
 if command -v ldd >/dev/null 2>&1; then
   echo "==> Linkage check"
@@ -93,4 +100,4 @@ else
 fi
 
 echo "==> Artifacts"
-ls -lh "$OUT_DIR"/alocals3-server "$OUT_DIR"/*.whl
+ls -lh "$OUT_DIR"/alocals3-server "$OUT_DIR"/alocals3-migrate2pg "$OUT_DIR"/*.whl

@@ -8,6 +8,7 @@ use axum::{Json, Router};
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::Parser;
+use percent_encoding::percent_decode_str;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgPoolOptions, PgRow};
@@ -123,6 +124,7 @@ struct ObjectRow {
     content_type: String,
     etag: String,
     updated_at: String,
+    metadata: HashMap<String, String>,
 }
 
 struct GcObjectRef {
@@ -145,6 +147,7 @@ struct ObjectInfo {
     content_type: String,
     etag: String,
     updated_at: String,
+    metadata: HashMap<String, String>,
 }
 
 struct StoredObject {
@@ -549,9 +552,65 @@ async fn list_objects_v2(
 async fn put_object(
     State(state): State<AppState>,
     AxumPath((bucket, key)): AxumPath<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Response> {
+    if let Some(copy_source) = header_str(&headers, "x-amz-copy-source") {
+        let (source_bucket, source_key) = parse_copy_source(copy_source)?;
+        let directive = header_str(&headers, "x-amz-metadata-directive")
+            .unwrap_or("COPY")
+            .to_ascii_uppercase();
+        if directive != "COPY" && directive != "REPLACE" {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "x-amz-metadata-directive must be COPY or REPLACE",
+            ));
+        }
+        let replacement_metadata = if directive == "REPLACE" {
+            Some(extract_user_metadata(&headers)?)
+        } else {
+            None
+        };
+        let replacement_content_type = if directive == "REPLACE" {
+            header_str(&headers, header::CONTENT_TYPE.as_str())
+        } else {
+            None
+        };
+        let (info, retired_path) = state
+            .storage
+            .copy_object(
+                &source_bucket,
+                &source_key,
+                &bucket,
+                &key,
+                replacement_content_type,
+                replacement_metadata,
+            )
+            .await?;
+        if let (Some(gc), Some(path)) = (&state.gc, retired_path) {
+            gc.reclaim_path(path);
+        }
+        let mut response = if params
+            .get("output")
+            .map(|value| value.eq_ignore_ascii_case("json"))
+            .unwrap_or(false)
+        {
+            Json(info.clone()).into_response()
+        } else {
+            (
+                [(header::CONTENT_TYPE, "application/xml")],
+                copy_object_result_xml(&info),
+            )
+                .into_response()
+        };
+        response.headers_mut().insert(
+            header::ETAG,
+            HeaderValue::from_str(&format!("\"{}\"", info.etag)).unwrap(),
+        );
+        return Ok(response);
+    }
+
     validate_content_md5(&headers, &body)?;
     let existing = state.storage.get_object_info(&bucket, &key).await?;
 
@@ -580,9 +639,10 @@ async fn put_object(
     }
 
     let content_type = header_str(&headers, header::CONTENT_TYPE.as_str()).map(str::to_string);
+    let metadata = extract_user_metadata(&headers)?;
     let (info, created, retired_path) = state
         .storage
-        .put_object(&bucket, &key, &body, content_type.as_deref())
+        .put_object(&bucket, &key, &body, content_type.as_deref(), metadata)
         .await?;
     if let (Some(gc), Some(path)) = (&state.gc, retired_path) {
         gc.reclaim_path(path);
@@ -856,6 +916,7 @@ impl Storage {
         key: &str,
         body: &[u8],
         content_type: Option<&str>,
+        metadata: HashMap<String, String>,
     ) -> ApiResult<(ObjectInfo, bool, Option<String>)> {
         validate_bucket(bucket)?;
         let normalized_key = normalize_key(key)?;
@@ -887,6 +948,7 @@ impl Storage {
                     &final_content_type,
                     &etag,
                     &now,
+                    &metadata,
                 )
                 .await?;
             let row = self.object_row(bucket_row.id, &normalized_key).await?;
@@ -896,6 +958,104 @@ impl Storage {
         .await;
         self.unregister_active_write(&relative_path).await;
         result
+    }
+
+    async fn copy_object(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        destination_bucket: &str,
+        destination_key: &str,
+        replacement_content_type: Option<&str>,
+        replacement_metadata: Option<HashMap<String, String>>,
+    ) -> ApiResult<(ObjectInfo, Option<String>)> {
+        validate_bucket(source_bucket)?;
+        validate_bucket(destination_bucket)?;
+        let source_key = normalize_key(source_key)?;
+        let destination_key = normalize_key(destination_key)?;
+        let source_bucket_row = self.bucket_row(source_bucket).await?;
+        let destination_bucket_row = self.bucket_row(destination_bucket).await?;
+        let source = self.object_row(source_bucket_row.id, &source_key).await?;
+        match tokio::fs::metadata(self.objects_root().join(&source.file_path)).await {
+            Ok(metadata) if metadata.is_file() => {}
+            _ => return Err(ApiError::new(StatusCode::NOT_FOUND, "Object data missing")),
+        }
+        let previous_path = self
+            .object_row_optional(destination_bucket_row.id, &destination_key)
+            .await?
+            .map(|row| row.file_path);
+        let now = now_utc();
+        let replacement_metadata_json = replacement_metadata
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|err| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Metadata serialization error: {err}"),
+                )
+            })?;
+
+        // A copy only creates a second database reference to the content-addressed
+        // blob. INSERT ... SELECT is one statement so concurrent source deletion
+        // cannot leave a destination reference to a reclaimed blob.
+        let row = match self {
+            Self::Sqlite { pool, .. } => sqlx::query(
+                "INSERT INTO objects
+                 (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at, metadata)
+                 SELECT ?3, ?4, file_path, size, COALESCE(?5, content_type), etag, ?7, ?7,
+                        COALESCE(?6, metadata)
+                 FROM objects WHERE bucket_id = ?1 AND key = ?2
+                 ON CONFLICT(bucket_id, key) DO UPDATE SET
+                    file_path = excluded.file_path, size = excluded.size,
+                    content_type = excluded.content_type, etag = excluded.etag,
+                    updated_at = excluded.updated_at, metadata = excluded.metadata
+                 RETURNING key, file_path, size, content_type, etag, updated_at, metadata",
+            )
+            .bind(source_bucket_row.id)
+            .bind(&source_key)
+            .bind(destination_bucket_row.id)
+            .bind(&destination_key)
+            .bind(replacement_content_type)
+            .bind(replacement_metadata_json.as_deref())
+            .bind(&now)
+            .fetch_optional(pool)
+            .await?
+            .map(object_row_from_sqlite),
+            Self::Postgres { pool, .. } => sqlx::query(
+                "WITH source AS (
+                    SELECT file_path, size, content_type, etag, metadata
+                    FROM objects WHERE bucket_id = $1 AND key = $2 FOR SHARE
+                 )
+                 INSERT INTO objects
+                 (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at, metadata)
+                 SELECT $3, $4, file_path, size, COALESCE($5, content_type), etag, $7, $7,
+                        COALESCE($6, metadata)
+                 FROM source
+                 ON CONFLICT(bucket_id, key) DO UPDATE SET
+                    file_path = EXCLUDED.file_path, size = EXCLUDED.size,
+                    content_type = EXCLUDED.content_type, etag = EXCLUDED.etag,
+                    updated_at = EXCLUDED.updated_at, metadata = EXCLUDED.metadata
+                 RETURNING key, file_path, size, content_type, etag, updated_at, metadata",
+            )
+            .bind(source_bucket_row.id)
+            .bind(&source_key)
+            .bind(destination_bucket_row.id)
+            .bind(&destination_key)
+            .bind(replacement_content_type)
+            .bind(replacement_metadata_json.as_deref())
+            .bind(&now)
+            .fetch_optional(pool)
+            .await?
+            .map(object_row_from_pg),
+        }
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Object not found"))?;
+        match tokio::fs::metadata(self.objects_root().join(&row.file_path)).await {
+            Ok(metadata) if metadata.is_file() => {}
+            _ => return Err(ApiError::new(StatusCode::NOT_FOUND, "Object data missing")),
+        }
+        let retired_path = previous_path.filter(|path| path != &row.file_path);
+        Ok((row.info(destination_bucket), retired_path))
     }
 
     async fn get_object(&self, bucket: &str, key: &str) -> ApiResult<StoredObject> {
@@ -1194,14 +1354,14 @@ impl Storage {
     async fn object_rows(&self, bucket_id: i64) -> ApiResult<Vec<ObjectRow>> {
         match self {
             Self::Sqlite { pool, .. } => {
-                let rows = sqlx::query("SELECT key, file_path, size, content_type, etag, updated_at FROM objects WHERE bucket_id = ?1 ORDER BY key ASC")
+                let rows = sqlx::query("SELECT key, file_path, size, content_type, etag, updated_at, metadata FROM objects WHERE bucket_id = ?1 ORDER BY key ASC")
                     .bind(bucket_id)
                     .fetch_all(pool)
                     .await?;
                 Ok(rows.into_iter().map(object_row_from_sqlite).collect())
             }
             Self::Postgres { pool, .. } => {
-                let rows = sqlx::query("SELECT key, file_path, size, content_type, etag, updated_at FROM objects WHERE bucket_id = $1 ORDER BY key ASC")
+                let rows = sqlx::query("SELECT key, file_path, size, content_type, etag, updated_at, metadata FROM objects WHERE bucket_id = $1 ORDER BY key ASC")
                     .bind(bucket_id)
                     .fetch_all(pool)
                     .await?;
@@ -1219,7 +1379,7 @@ impl Storage {
     async fn object_row_optional(&self, bucket_id: i64, key: &str) -> ApiResult<Option<ObjectRow>> {
         match self {
             Self::Sqlite { pool, .. } => {
-                let row = sqlx::query("SELECT key, file_path, size, content_type, etag, updated_at FROM objects WHERE bucket_id = ?1 AND key = ?2")
+                let row = sqlx::query("SELECT key, file_path, size, content_type, etag, updated_at, metadata FROM objects WHERE bucket_id = ?1 AND key = ?2")
                     .bind(bucket_id)
                     .bind(key)
                     .fetch_optional(pool)
@@ -1227,7 +1387,7 @@ impl Storage {
                 Ok(row.map(object_row_from_sqlite))
             }
             Self::Postgres { pool, .. } => {
-                let row = sqlx::query("SELECT key, file_path, size, content_type, etag, updated_at FROM objects WHERE bucket_id = $1 AND key = $2")
+                let row = sqlx::query("SELECT key, file_path, size, content_type, etag, updated_at, metadata FROM objects WHERE bucket_id = $1 AND key = $2")
                     .bind(bucket_id)
                     .bind(key)
                     .fetch_optional(pool)
@@ -1327,18 +1487,26 @@ impl Storage {
         content_type: &str,
         etag: &str,
         updated_at: &str,
+        metadata: &HashMap<String, String>,
     ) -> ApiResult<bool> {
+        let metadata_json = serde_json::to_string(metadata).map_err(|err| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Metadata serialization error: {err}"),
+            )
+        })?;
         match self {
             Self::Sqlite { pool, .. } => {
                 let result = sqlx::query(
-                    "INSERT INTO objects (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                    "INSERT INTO objects (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at, metadata)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
                      ON CONFLICT(bucket_id, key) DO UPDATE SET
                         file_path = excluded.file_path,
                         size = excluded.size,
                         content_type = excluded.content_type,
                         etag = excluded.etag,
-                        updated_at = excluded.updated_at
+                        updated_at = excluded.updated_at,
+                        metadata = excluded.metadata
                      RETURNING created_at = updated_at",
                 )
                 .bind(bucket_id)
@@ -1348,20 +1516,22 @@ impl Storage {
                 .bind(content_type)
                 .bind(etag)
                 .bind(updated_at)
+                .bind(&metadata_json)
                 .fetch_one(pool)
                 .await?;
                 Ok(result.get(0))
             }
             Self::Postgres { pool, .. } => {
                 let row = sqlx::query(
-                    "INSERT INTO objects (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+                    "INSERT INTO objects (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at, metadata)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)
                      ON CONFLICT(bucket_id, key) DO UPDATE SET
                         file_path = EXCLUDED.file_path,
                         size = EXCLUDED.size,
                         content_type = EXCLUDED.content_type,
                         etag = EXCLUDED.etag,
-                        updated_at = EXCLUDED.updated_at
+                        updated_at = EXCLUDED.updated_at,
+                        metadata = EXCLUDED.metadata
                      RETURNING xmax = 0",
                 )
                 .bind(bucket_id)
@@ -1371,6 +1541,7 @@ impl Storage {
                 .bind(content_type)
                 .bind(etag)
                 .bind(updated_at)
+                .bind(&metadata_json)
                 .fetch_one(pool)
                 .await?;
                 Ok(row.get(0))
@@ -1388,6 +1559,7 @@ impl ObjectRow {
             content_type: self.content_type,
             etag: self.etag,
             updated_at: self.updated_at,
+            metadata: self.metadata,
         }
     }
 }
@@ -1408,6 +1580,7 @@ fn object_row_from_sqlite(row: sqlx::sqlite::SqliteRow) -> ObjectRow {
         content_type: row.get(3),
         etag: row.get(4),
         updated_at: row.get(5),
+        metadata: metadata_from_json(row.get::<String, _>(6)),
     }
 }
 
@@ -1419,7 +1592,12 @@ fn object_row_from_pg(row: PgRow) -> ObjectRow {
         content_type: row.get(3),
         etag: row.get(4),
         updated_at: row.get(5),
+        metadata: metadata_from_json(row.get::<String, _>(6)),
     }
+}
+
+fn metadata_from_json(value: String) -> HashMap<String, String> {
+    serde_json::from_str(&value).unwrap_or_default()
 }
 
 async fn init_sqlite(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -1446,11 +1624,23 @@ async fn init_sqlite(pool: &SqlitePool) -> anyhow::Result<()> {
             etag TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             created_at TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}',
             UNIQUE(bucket_id, key)
         )",
     )
     .execute(pool)
     .await?;
+    let columns = sqlx::query("PRAGMA table_info(objects)")
+        .fetch_all(pool)
+        .await?;
+    if !columns
+        .iter()
+        .any(|row| row.get::<String, _>(1) == "metadata")
+    {
+        sqlx::query("ALTER TABLE objects ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
+            .execute(pool)
+            .await?;
+    }
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_bucket_key ON objects (bucket_id, key)")
         .execute(pool)
         .await?;
@@ -1484,11 +1674,15 @@ async fn init_pg(pool: &PgPool) -> anyhow::Result<()> {
             etag VARCHAR(64) NOT NULL,
             updated_at TEXT NOT NULL,
             created_at TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}',
             UNIQUE(bucket_id, key)
         )",
     )
     .execute(pool)
     .await?;
+    sqlx::query("ALTER TABLE objects ADD COLUMN IF NOT EXISTS metadata TEXT NOT NULL DEFAULT '{}'")
+        .execute(pool)
+        .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_bucket_key ON objects (bucket_id, key)")
         .execute(pool)
         .await?;
@@ -1508,6 +1702,7 @@ fn object_response(
         header::ETAG,
         HeaderValue::from_str(&format!("\"{}\"", obj.info.etag)).unwrap(),
     );
+    insert_user_metadata_headers(&mut response_headers, &obj.info.metadata)?;
     response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     response_headers.insert(
         header::LAST_MODIFIED,
@@ -1567,6 +1762,7 @@ fn object_head_response(info: ObjectInfo, headers: &HeaderMap) -> ApiResult<Resp
         header::ETAG,
         HeaderValue::from_str(&format!("\"{}\"", info.etag)).unwrap(),
     );
+    insert_user_metadata_headers(&mut response_headers, &info.metadata)?;
     response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     response_headers.insert(
         header::LAST_MODIFIED,
@@ -1712,6 +1908,60 @@ fn validate_content_md5(headers: &HeaderMap, body: &[u8]) -> ApiResult<()> {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "BadDigest"));
     }
     Ok(())
+}
+
+fn extract_user_metadata(headers: &HeaderMap) -> ApiResult<HashMap<String, String>> {
+    let mut metadata = HashMap::new();
+    for (name, value) in headers {
+        let Some(key) = name.as_str().strip_prefix("x-amz-meta-") else {
+            continue;
+        };
+        if key.is_empty() {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "Empty metadata key"));
+        }
+        let value = value
+            .to_str()
+            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid metadata value"))?;
+        metadata.insert(key.to_string(), value.to_string());
+    }
+    Ok(metadata)
+}
+
+fn insert_user_metadata_headers(
+    headers: &mut HeaderMap,
+    metadata: &HashMap<String, String>,
+) -> ApiResult<()> {
+    for (key, value) in metadata {
+        let name = format!("x-amz-meta-{key}")
+            .parse::<http::HeaderName>()
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Invalid stored metadata key",
+                )
+            })?;
+        let value = HeaderValue::from_str(value).map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid stored metadata value",
+            )
+        })?;
+        headers.insert(name, value);
+    }
+    Ok(())
+}
+
+fn parse_copy_source(value: &str) -> ApiResult<(String, String)> {
+    let without_query = value.split('?').next().unwrap_or(value);
+    let decoded = percent_decode_str(without_query)
+        .decode_utf8()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid x-amz-copy-source"))?;
+    let (bucket, key) = decoded
+        .trim_start_matches('/')
+        .split_once('/')
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Invalid x-amz-copy-source"))?;
+    validate_bucket(bucket)?;
+    Ok((bucket.to_string(), normalize_key(key)?))
 }
 
 fn etag_matches(header_value: &str, current_etag: &str) -> bool {
@@ -1873,6 +2123,14 @@ fn list_objects_v2_xml(result: &ListObjectsV2Result) -> String {
     xml
 }
 
+fn copy_object_result_xml(info: &ObjectInfo) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>{}</LastModified><ETag>&quot;{}&quot;</ETag></CopyObjectResult>",
+        escape_xml(&info.updated_at),
+        escape_xml(&info.etag)
+    )
+}
+
 fn escape_xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1919,13 +2177,13 @@ mod tests {
     async fn targeted_gc_reclaims_only_the_replaced_blob() {
         let (storage, root) = test_storage().await;
         let (_, created, _) = storage
-            .put_object("test-bucket", "item", b"old", None)
+            .put_object("test-bucket", "item", b"old", None, HashMap::new())
             .await
             .unwrap();
         assert!(created);
 
         let (_, created, retired_path) = storage
-            .put_object("test-bucket", "item", b"new", None)
+            .put_object("test-bucket", "item", b"new", None, HashMap::new())
             .await
             .unwrap();
         assert!(!created);
@@ -1953,16 +2211,16 @@ mod tests {
     async fn targeted_gc_preserves_a_blob_shared_by_another_key() {
         let (storage, root) = test_storage().await;
         storage
-            .put_object("test-bucket", "first", b"shared", None)
+            .put_object("test-bucket", "first", b"shared", None, HashMap::new())
             .await
             .unwrap();
         storage
-            .put_object("test-bucket", "second", b"shared", None)
+            .put_object("test-bucket", "second", b"shared", None, HashMap::new())
             .await
             .unwrap();
 
         let (_, _, retired_path) = storage
-            .put_object("test-bucket", "first", b"replacement", None)
+            .put_object("test-bucket", "first", b"replacement", None, HashMap::new())
             .await
             .unwrap();
         let retired_path = retired_path.expect("the first key must retire its old blob");
@@ -1993,6 +2251,7 @@ mod tests {
                 "large.glb",
                 b"payload",
                 Some("model/gltf-binary"),
+                HashMap::new(),
             )
             .await
             .unwrap();
@@ -2019,6 +2278,78 @@ mod tests {
             .get_object("test-bucket", "large.glb")
             .await
             .is_err());
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_object_shares_blob_and_preserves_metadata() {
+        let (storage, root) = test_storage().await;
+        let mut metadata = HashMap::new();
+        metadata.insert("foo".to_string(), "bar".to_string());
+        storage
+            .put_object(
+                "test-bucket",
+                "source.bin",
+                b"large payload",
+                Some("application/x-source"),
+                metadata.clone(),
+            )
+            .await
+            .unwrap();
+
+        let source_bucket = storage.bucket_row("test-bucket").await.unwrap();
+        let source = storage
+            .object_row(source_bucket.id, "source.bin")
+            .await
+            .unwrap();
+        let (copied, retired) = storage
+            .copy_object(
+                "test-bucket",
+                "source.bin",
+                "test-bucket",
+                "copy.bin",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let destination = storage
+            .object_row(source_bucket.id, "copy.bin")
+            .await
+            .unwrap();
+
+        assert_eq!(destination.file_path, source.file_path);
+        assert_eq!(copied.metadata, metadata);
+        assert_eq!(copied.content_type, "application/x-source");
+        assert_eq!(retired, None);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_object_can_replace_metadata_without_copying_blob() {
+        let (storage, root) = test_storage().await;
+        storage
+            .put_object("test-bucket", "source", b"payload", None, HashMap::new())
+            .await
+            .unwrap();
+        let mut replacement = HashMap::new();
+        replacement.insert("foo".to_string(), "new".to_string());
+        let (copied, _) = storage
+            .copy_object(
+                "test-bucket",
+                "source",
+                "test-bucket",
+                "destination",
+                Some("text/custom"),
+                Some(replacement.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(copied.metadata, replacement);
+        assert_eq!(copied.content_type, "text/custom");
+
+        let response = object_head_response(copied, &HeaderMap::new()).unwrap();
+        assert_eq!(response.headers()["x-amz-meta-foo"], "new");
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

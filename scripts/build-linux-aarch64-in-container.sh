@@ -51,13 +51,17 @@ docker "${CONTAINER_ARGS[@]}" \
       --locked \
       --no-default-features \
       --features server,server-binary \
-      --bin alocals3-server
+      --bin alocals3-server \
+      --bin alocals3-migrate2pg
 
     server_src="$CARGO_TARGET_DIR/release/alocals3-server"
+    migrate_src="$CARGO_TARGET_DIR/release/alocals3-migrate2pg"
     install -m 755 "$server_src" "$OUT_DIR/alocals3-server"
+    install -m 755 "$migrate_src" "$OUT_DIR/alocals3-migrate2pg"
     rm -rf /io/alocals3/bin
     mkdir -p /io/alocals3/bin
     install -m 755 "$server_src" /io/alocals3/bin/alocals3-server
+    install -m 755 "$migrate_src" /io/alocals3/bin/alocals3-migrate2pg
 
     echo "==> Building Linux aarch64 cp312 abi3 wheel"
     maturin build \
@@ -70,5 +74,5 @@ docker "${CONTAINER_ARGS[@]}" \
   '
 
 echo "==> Artifact metadata"
-file "$OUT_DIR/alocals3-server"
-ls -lh "$OUT_DIR/alocals3-server" "$OUT_DIR"/*aarch64.whl
+file "$OUT_DIR/alocals3-server" "$OUT_DIR/alocals3-migrate2pg"
+ls -lh "$OUT_DIR/alocals3-server" "$OUT_DIR/alocals3-migrate2pg" "$OUT_DIR"/*aarch64.whl

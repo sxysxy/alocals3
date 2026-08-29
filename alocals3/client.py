@@ -17,10 +17,11 @@ class ALocalS3Client:
         base_url: str = "http://127.0.0.1:8000",
         timeout: float = 10.0,
         disable_proxy: bool = False,
+        service_token: str | None = None,
     ) -> None:
         if RustHttpClient is None:
             raise RuntimeError("alocals3._alocals3_native is required; install with: pip install -e .")
-        self._client = RustHttpClient(base_url, timeout, disable_proxy)
+        self._client = RustHttpClient(base_url, timeout, disable_proxy, service_token)
 
     def __enter__(self) -> "ALocalS3Client":
         return self
@@ -181,8 +182,14 @@ class ALocalS3ClientAsync:
         base_url: str = "http://127.0.0.1:8000",
         timeout: float = 10.0,
         disable_proxy: bool = False,
+        service_token: str | None = None,
     ) -> None:
-        self._sync = ALocalS3Client(base_url=base_url, timeout=timeout, disable_proxy=disable_proxy)
+        self._sync = ALocalS3Client(
+            base_url=base_url,
+            timeout=timeout,
+            disable_proxy=disable_proxy,
+            service_token=service_token,
+        )
 
     async def __aenter__(self) -> "ALocalS3ClientAsync":
         return self

@@ -103,6 +103,10 @@ Server CLI flags:
 - `--storage-root`: object payload root directory
 - `--log-level`: log level or `tracing_subscriber` filter directive, default `info`
 - `--max-upload-size`: maximum upload body size in bytes, default `0` disables the axum body limit
+- `--auth-enabled <true|false>`: explicitly enable or disable authentication, default `false`
+- `--service-token`: bearer token for the internal `/s3` API; empty by default
+- `--user-auth-secret`: HMAC secret for the read-only `/api/object` API; empty by default
+- `--object-auth-cookie`: browser access-token cookie name, default `alocals3-auth-cookie`
 - `--version`: print server version and author information
 
 Environment variables:
@@ -111,6 +115,119 @@ Environment variables:
 - `ALOCALS3_STORAGE_ROOT`: default `./data`
 - `ALOCALS3_LOG_LEVEL`: default `info`
 - `ALOCALS3_MAX_UPLOAD_SIZE`: default `0`
+- `ALOCALS3_AUTH_ENABLED`: authentication switch, default `false`; the CLI flag takes precedence
+- `ALOCALS3_SERVICE_TOKEN`: bearer token required by `/s3` when authentication is enabled
+- `ALOCALS3_USER_AUTH_SECRET`: HMAC secret used to validate Lauraycs access tokens on `/api/object`
+- `ALOCALS3_OBJECT_AUTH_COOKIE`: access-token cookie name, default `alocals3-auth-cookie`
+
+### Authentication
+
+Authentication is controlled explicitly by `--auth-enabled <true|false>` (or
+`ALOCALS3_AUTH_ENABLED`). Credentials no longer implicitly enable it:
+
+- With `--auth-enabled true`, `/s3` requires
+  `Authorization: Bearer <service-token>`, while
+  `/api/object/{bucket}/{key}` requires a valid HMAC user token. Both
+  `--service-token` and `--user-auth-secret` are required; the server refuses to
+  start if either is empty.
+- With `--auth-enabled false` (the default), both API families are accessible
+  without credentials. Token and secret values may remain configured, but are
+  ignored until authentication is enabled.
+- `/healthz` does not require authentication.
+
+The switch and credentials can all be supplied directly on the command line:
+
+```bash
+SERVICE_TOKEN="$(openssl rand -hex 32)"
+USER_AUTH_SECRET="$(openssl rand -hex 32)"
+
+target/release/alocals3-server \
+  --auth-enabled true \
+  --service-token "$SERVICE_TOKEN" \
+  --user-auth-secret "$USER_AUTH_SECRET" \
+  --object-auth-cookie "alocals3-auth-cookie" \
+  --database-url "sqlite:///./alocals3.db" \
+  --storage-root ./data
+```
+
+Environment variables are also supported. For the remaining examples, export
+the same values before starting the server and clients:
+
+```bash
+export ALOCALS3_AUTH_ENABLED=true
+export ALOCALS3_SERVICE_TOKEN="$SERVICE_TOKEN"
+export ALOCALS3_USER_AUTH_SECRET="$USER_AUTH_SECRET"
+export ALOCALS3_OBJECT_AUTH_COOKIE="alocals3-auth-cookie" # optional
+```
+
+Use the protected `/s3` API with curl or the Python client:
+
+```bash
+curl -H "Authorization: Bearer ${ALOCALS3_SERVICE_TOKEN}" \
+  http://127.0.0.1:8000/s3
+
+# The CLI and Python client also read ALOCALS3_SERVICE_TOKEN automatically.
+python -m alocals3.client --endpoint http://127.0.0.1:8000 LIST_BUCKETS
+```
+
+```python
+from alocals3.client import ALocalS3Client
+
+with ALocalS3Client(
+    "http://127.0.0.1:8000",
+    service_token="the-same-service-token-as-the-server",
+) as client:
+    print(client.list_buckets())
+```
+
+A user access token has the form `<payload>.<signature>`. `payload` is the
+unpadded URL-safe Base64 encoding of
+`<username>|<access>|<expires-unix-seconds>|<nonce>`, and `signature` is the
+lowercase hex HMAC-SHA256 of the encoded payload using
+`ALOCALS3_USER_AUTH_SECRET`. The server requires a non-empty username and nonce,
+checks the expiry and signature, and currently carries the `access` field
+without interpreting it as an authorization rule. Lauraycs normally issues
+this token; the following standalone example shows the exact wire format:
+
+```bash
+USER_TOKEN="$(python - <<'PY'
+import base64, hashlib, hmac, os, secrets, time
+
+raw = f"demo-user|read|{int(time.time()) + 3600}|{secrets.token_hex(16)}"
+payload = base64.urlsafe_b64encode(raw.encode()).rstrip(b"=").decode()
+signature = hmac.new(
+    os.environ["ALOCALS3_USER_AUTH_SECRET"].encode(),
+    payload.encode(),
+    hashlib.sha256,
+).hexdigest()
+print(f"{payload}.{signature}")
+PY
+)"
+
+curl -H "Authorization: Bearer ${USER_TOKEN}" \
+  http://127.0.0.1:8000/api/object/demo/file.bin
+```
+
+Browsers may send the same token in the cookie configured by
+`ALOCALS3_OBJECT_AUTH_COOKIE`; for example,
+`Cookie: alocals3-auth-cookie=<user-token>`. A Bearer header takes precedence
+when both are present. Amazon S3 does not define an authentication cookie name;
+its SigV4 authentication uses the `Authorization` header, query parameters, or
+browser POST fields. `alocals3-auth-cookie` is therefore an alocals3-specific
+name, not an `x-amz-*` protocol field. CloudFront signed-cookie names are not
+used because CloudFront's three-cookie signature format is a different protocol.
+
+To disable authentication explicitly, restart with the CLI switch set to
+`false` (this overrides `ALOCALS3_AUTH_ENABLED=true`):
+
+```bash
+target/release/alocals3-server \
+  --auth-enabled false \
+  --database-url "sqlite:///./alocals3.db" \
+  --storage-root ./data
+```
+
+Run an unauthenticated deployment only on a trusted development machine.
 
 Database URL examples:
 
@@ -145,6 +262,7 @@ Object keys, bucket names, prefixes, delimiters, and continuation tokens are UTF
 - `GET /s3/{bucket}/{key}`: download object
 - `HEAD /s3/{bucket}/{key}`: object metadata
 - `DELETE /s3/{bucket}/{key}`: delete object
+- `GET|HEAD /api/object/{bucket}/{key}`: authenticated, read-only browser object access
 
 Supported object features:
 
@@ -171,7 +289,11 @@ from pathlib import Path
 
 from alocals3.client import ALocalS3Client, ALocalS3ClientAsync
 
-with ALocalS3Client("http://127.0.0.1:8000", disable_proxy=True) as client:
+with ALocalS3Client(
+    "http://127.0.0.1:8000",
+    disable_proxy=True,
+    service_token="the-internal-service-token",
+) as client:
     client.create_bucket("demo")
     info = client.put_object("demo", "logs/数据.txt", Path("data.txt"))
     print(info["etag"])

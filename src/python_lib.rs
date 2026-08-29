@@ -53,16 +53,40 @@ struct RustObjectWriter {
 #[pymethods]
 impl RustHttpClient {
     #[new]
-    #[pyo3(signature = (base_url="http://127.0.0.1:8000", timeout=10.0, disable_proxy=false))]
-    fn new(base_url: &str, timeout: f64, disable_proxy: bool) -> PyResult<Self> {
+    #[pyo3(signature = (base_url="http://127.0.0.1:8000", timeout=10.0, disable_proxy=false, service_token=None))]
+    fn new(
+        base_url: &str,
+        timeout: f64,
+        disable_proxy: bool,
+        service_token: Option<&str>,
+    ) -> PyResult<Self> {
         let timeout = std::time::Duration::from_secs_f64(timeout.max(0.001));
+        let resolved_service_token = service_token
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                std::env::var("ALOCALS3_SERVICE_TOKEN")
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            });
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        if let Some(token) = resolved_service_token {
+            let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| PyValueError::new_err("invalid alocals3 service token"))?;
+            default_headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
         let mut builder = reqwest::blocking::Client::builder()
-            .timeout(timeout);
+            .timeout(timeout)
+            .default_headers(default_headers.clone());
         if disable_proxy {
             builder = builder.no_proxy();
         }
         let client = builder.build().map_err(http_error)?;
-        let mut stream_builder = reqwest::blocking::Client::builder().connect_timeout(timeout);
+        let mut stream_builder = reqwest::blocking::Client::builder()
+            .connect_timeout(timeout)
+            .default_headers(default_headers);
         if disable_proxy {
             stream_builder = stream_builder.no_proxy();
         }

@@ -1,3 +1,8 @@
+# Version 0.9.0
+
+- Add optional bearer-token authentication for the internal `/s3` API
+- Add HMAC access-token authentication for the read-only `/api/object` API
+
 # Version 0.8.0
 
 - Add O(1) S3-compatible CopyObject with `x-amz-copy-source`

@@ -1,13 +1,14 @@
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
-use axum::middleware::{from_fn, Next};
+use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::Parser;
+use hmac::{Hmac, Mac};
 use percent_encoding::percent_decode_str;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -21,6 +22,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
+use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
@@ -69,12 +71,37 @@ struct Args {
     gc_grace_secs: u64,
     #[arg(long, env = "ALOCALS3_GC_START_DELAY_SECS", default_value_t = 30)]
     gc_start_delay_secs: u64,
+    #[arg(
+        long,
+        env = "ALOCALS3_AUTH_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    auth_enabled: bool,
+    #[arg(long, env = "ALOCALS3_SERVICE_TOKEN", default_value = "")]
+    service_token: String,
+    #[arg(long, env = "ALOCALS3_USER_AUTH_SECRET", default_value = "")]
+    user_auth_secret: String,
+    #[arg(
+        long,
+        env = "ALOCALS3_OBJECT_AUTH_COOKIE",
+        default_value = "alocals3-auth-cookie"
+    )]
+    object_auth_cookie: String,
 }
 
 #[derive(Clone)]
 struct AppState {
     storage: Arc<Storage>,
     gc: Option<Arc<GarbageCollector>>,
+    auth: Arc<AuthConfig>,
+}
+
+struct AuthConfig {
+    enabled: bool,
+    service_token: String,
+    user_auth_secret: String,
+    object_auth_cookie: String,
 }
 
 struct GarbageCollector {
@@ -323,7 +350,8 @@ fn database_backend(database_url: &str) -> &'static str {
 async fn request_logging(request: Request<Body>, next: Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
-    let should_log = path == "/healthz" || path.starts_with("/s3");
+    let should_log =
+        path == "/healthz" || path.starts_with("/s3") || path.starts_with("/api/object/");
     if !should_log {
         return next.run(request).await;
     }
@@ -382,19 +410,142 @@ fn extract_bucket_key(path: &str) -> (&str, String) {
         .split('/')
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
-    if parts.len() < 2 || parts[0] != "s3" {
+    let prefix_len = if parts.first() == Some(&"s3") {
+        1
+    } else if parts.get(0..2) == Some(&["api", "object"][..]) {
+        2
+    } else {
+        return ("-", "-".to_string());
+    };
+    if parts.len() <= prefix_len {
         return ("-", "-".to_string());
     }
-    let bucket = parts[1];
-    if parts.len() == 2 || parts.get(2) == Some(&"objects") {
+    let bucket = parts[prefix_len];
+    if parts.len() == prefix_len + 1 || (prefix_len == 1 && parts.get(2) == Some(&"objects")) {
         return (bucket, "-".to_string());
     }
-    (bucket, parts[2..].join("/"))
+    (bucket, parts[prefix_len + 1..].join("/"))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    header_str(headers, header::AUTHORIZATION.as_str())
+        .and_then(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn cookie_token<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str> {
+    let cookie = header_str(headers, header::COOKIE.as_str())?;
+    cookie.split(';').find_map(|part| {
+        let (name, value) = part.trim().split_once('=')?;
+        (name == cookie_name && !value.is_empty()).then_some(value)
+    })
+}
+
+fn constant_time_equal(left: &str, right: &str) -> bool {
+    left.len() == right.len() && bool::from(left.as_bytes().ct_eq(right.as_bytes()))
+}
+
+fn valid_user_access_token(token: &str, secret: &str) -> bool {
+    if token.is_empty() || secret.is_empty() {
+        return false;
+    }
+    let Some((payload, supplied_signature)) = token.split_once('.') else {
+        return false;
+    };
+    type HmacSha256 = Hmac<Sha256>;
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(payload.as_bytes());
+    let expected_signature = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if !constant_time_equal(&expected_signature, supplied_signature) {
+        return false;
+    }
+    let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+        return false;
+    };
+    let Ok(raw) = std::str::from_utf8(&decoded) else {
+        return false;
+    };
+    let mut parts = raw.splitn(4, '|');
+    let username = parts.next().unwrap_or_default();
+    let _access = parts.next().unwrap_or_default();
+    let expires = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let nonce = parts.next().unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(u64::MAX);
+    !username.is_empty() && !nonce.is_empty() && expires >= now
+}
+
+fn unauthorized_response(detail: &'static str) -> Response {
+    let mut response = (StatusCode::UNAUTHORIZED, detail).into_response();
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response
+}
+
+async fn request_authorization(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if !state.auth.enabled {
+        return next.run(request).await;
+    }
+    let path = request.uri().path();
+    if path.starts_with("/s3") {
+        if !state.auth.service_token.is_empty()
+            && !bearer_token(request.headers())
+                .map(|value| constant_time_equal(value, &state.auth.service_token))
+                .unwrap_or(false)
+        {
+            return unauthorized_response("Invalid alocals3 service credential");
+        }
+    } else if path.starts_with("/api/object/") {
+        if state.auth.user_auth_secret.is_empty() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "alocals3 public object authentication is not configured",
+            )
+                .into_response();
+        }
+        let token = bearer_token(request.headers())
+            .or_else(|| cookie_token(request.headers(), &state.auth.object_auth_cookie));
+        if !token
+            .map(|value| valid_user_access_token(value, &state.auth.user_auth_secret))
+            .unwrap_or(false)
+        {
+            return unauthorized_response("Invalid or expired object access credential");
+        }
+    }
+    next.run(request).await
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if args.auth_enabled && args.service_token.trim().is_empty() {
+        anyhow::bail!("--service-token is required when --auth-enabled=true");
+    }
+    if args.auth_enabled && args.user_auth_secret.trim().is_empty() {
+        anyhow::bail!("--user-auth-secret is required when --auth-enabled=true");
+    }
     init_logging(&args.log_level)?;
     tracing::info!(
         host = %args.host,
@@ -406,6 +557,7 @@ async fn main() -> anyhow::Result<()> {
         gc_interval_secs = args.gc_interval_secs,
         gc_grace_secs = args.gc_grace_secs,
         gc_start_delay_secs = args.gc_start_delay_secs,
+        auth_enabled = args.auth_enabled,
         "starting alocals3 server"
     );
     let storage = Arc::new(Storage::connect(&args.database_url, args.storage_root).await?);
@@ -425,6 +577,16 @@ async fn main() -> anyhow::Result<()> {
     } else {
         DefaultBodyLimit::max(args.max_upload_size)
     };
+    let state = AppState {
+        storage,
+        gc,
+        auth: Arc::new(AuthConfig {
+            enabled: args.auth_enabled,
+            service_token: args.service_token,
+            user_auth_secret: args.user_auth_secret,
+            object_auth_cookie: args.object_auth_cookie,
+        }),
+    };
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/s3", get(list_buckets))
@@ -442,9 +604,14 @@ async fn main() -> anyhow::Result<()> {
                 .head(head_object)
                 .delete(delete_object),
         )
+        .route(
+            "/api/object/:bucket/*key",
+            get(get_public_object).head(head_public_object),
+        )
         .layer(body_limit)
+        .layer(from_fn_with_state(state.clone(), request_authorization))
         .layer(from_fn(request_logging))
-        .with_state(AppState { storage, gc });
+        .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -675,6 +842,20 @@ async fn get_object(
     )
 }
 
+async fn get_public_object(
+    State(state): State<AppState>,
+    AxumPath((bucket, key)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let mut object = state.storage.get_object(&bucket, &key).await?;
+    prepare_public_object(&mut object);
+    let terrain_gzip = object.info.key.to_ascii_lowercase().ends_with(".terrain")
+        && object.body.starts_with(&[0x1f, 0x8b]);
+    let mut response = object_response(object, &headers, true)?;
+    apply_public_object_headers(&mut response, &bucket, &key, terrain_gzip);
+    Ok(response)
+}
+
 async fn head_object(
     State(state): State<AppState>,
     AxumPath((bucket, key)): AxumPath<(String, String)>,
@@ -686,6 +867,164 @@ async fn head_object(
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Object not found"))?;
     object_head_response(info, &headers)
+}
+
+async fn head_public_object(
+    State(state): State<AppState>,
+    AxumPath((bucket, key)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let mut info = state
+        .storage
+        .get_object_info(&bucket, &key)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Object not found"))?;
+    let lower_key = info.key.to_ascii_lowercase();
+    info.content_type = public_content_type(&lower_key, &info.content_type).to_string();
+    let mut response = object_head_response(info, &headers)?;
+    apply_public_object_headers(&mut response, &bucket, &key, false);
+    Ok(response)
+}
+
+fn prepare_public_object(object: &mut StoredObject) {
+    let lower_key = object.info.key.to_ascii_lowercase();
+    if lower_key.ends_with("/3dtiles/tileset.json") {
+        sanitize_tileset_json(&mut object.body);
+    } else if lower_key.ends_with("/terrain/layer.json") {
+        sanitize_terrain_layer_json(&mut object.body);
+    }
+    object.info.content_type =
+        public_content_type(&lower_key, &object.info.content_type).to_string();
+    object.info.size = object.body.len() as i64;
+    object.info.etag = format!("{:x}", Sha256::digest(&object.body));
+}
+
+fn public_content_type<'a>(key: &str, fallback: &'a str) -> &'a str {
+    if key.ends_with(".png") {
+        "image/png"
+    } else if key.ends_with(".jpg") || key.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if key.ends_with(".webp") {
+        "image/webp"
+    } else if key.ends_with(".gif") {
+        "image/gif"
+    } else if key.ends_with(".svg") {
+        "image/svg+xml"
+    } else if key.ends_with(".terrain") {
+        "application/vnd.quantized-mesh"
+    } else if key.ends_with(".json") {
+        "application/json"
+    } else if key.ends_with(".gml") || key.ends_with(".citygml") {
+        "application/gml+xml"
+    } else if key.ends_with(".dae") {
+        "model/vnd.collada+xml"
+    } else if key.ends_with(".glb") {
+        "model/gltf-binary"
+    } else if key.ends_with(".gltf") {
+        "model/gltf+json"
+    } else {
+        fallback
+    }
+}
+
+fn sanitize_tileset_json(body: &mut Vec<u8>) {
+    let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return;
+    };
+    fn clean(tile: &mut serde_json::Value) -> bool {
+        let Some(tile) = tile.as_object_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        if let Some(content) = tile
+            .get_mut("content")
+            .and_then(|value| value.as_object_mut())
+        {
+            changed |= content.remove("url").is_some();
+        }
+        if let Some(contents) = tile
+            .get_mut("contents")
+            .and_then(|value| value.as_array_mut())
+        {
+            for content in contents {
+                if let Some(content) = content.as_object_mut() {
+                    changed |= content.remove("url").is_some();
+                }
+            }
+        }
+        if let Some(children) = tile
+            .get_mut("children")
+            .and_then(|value| value.as_array_mut())
+        {
+            for child in children {
+                changed |= clean(child);
+            }
+        }
+        changed
+    }
+    let changed = payload.get_mut("root").map(clean).unwrap_or(false);
+    if changed {
+        if let Ok(encoded) = serde_json::to_vec(&payload) {
+            *body = encoded;
+        }
+    }
+}
+
+fn sanitize_terrain_layer_json(body: &mut Vec<u8>) {
+    let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return;
+    };
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    if object
+        .get("metadataAvailability")
+        .is_some_and(|value| !value.is_null())
+        && object.get("available").is_some()
+    {
+        object.remove("metadataAvailability");
+        if let Ok(encoded) = serde_json::to_vec(&payload) {
+            *body = encoded;
+        }
+    }
+}
+
+fn apply_public_object_headers(
+    response: &mut Response,
+    bucket: &str,
+    key: &str,
+    terrain_gzip: bool,
+) {
+    let key = key.to_ascii_lowercase();
+    let bucket = bucket.to_ascii_lowercase();
+    let immutable = (bucket == "lauraycs-maps" && key.starts_with("system/gis/"))
+        || (key.contains("/simulation-results/")
+            && [".png", ".json", ".svg"]
+                .iter()
+                .any(|suffix| key.ends_with(suffix)))
+        || [".terrain", ".glb", ".gltf", ".b3dm", ".i3dm", ".cmpt"]
+            .iter()
+            .any(|suffix| key.ends_with(suffix));
+    let one_day = (bucket == "lauraycs-maps" && key.ends_with(".json"))
+        || [".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"]
+            .iter()
+            .any(|suffix| key.ends_with(suffix));
+    if immutable {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+    } else if one_day {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=86400"),
+        );
+    }
+    if terrain_gzip {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+    }
 }
 
 async fn delete_object(
@@ -2161,6 +2500,45 @@ impl From<std::io::Error> for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn user_token(secret: &str, expires: u64) -> String {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!("tester|user|{expires}|nonce"));
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(payload.as_bytes());
+        let signature = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("{payload}.{signature}")
+    }
+
+    #[test]
+    fn user_access_token_requires_valid_signature_and_expiry() {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let valid = user_token("secret", now + 60);
+        assert!(valid_user_access_token(&valid, "secret"));
+        assert!(!valid_user_access_token(&valid, "wrong-secret"));
+        assert!(!valid_user_access_token(
+            &user_token("secret", now.saturating_sub(1)),
+            "secret"
+        ));
+    }
+
+    #[test]
+    fn public_tileset_response_removes_legacy_url_but_keeps_uri() {
+        let mut body =
+            br#"{"root":{"content":{"uri":"tile.b3dm","url":"tile.b3dm"},"children":[]}}"#.to_vec();
+        sanitize_tileset_json(&mut body);
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["root"]["content"]["uri"], "tile.b3dm");
+        assert!(payload["root"]["content"].get("url").is_none());
+    }
 
     async fn test_storage() -> (Storage, PathBuf) {
         let root = std::env::temp_dir().join(format!("alocals3-targeted-gc-{}", Uuid::new_v4()));

@@ -1,6 +1,6 @@
 [package]
 name = "alocals3-rust"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 authors = ["alocals3 contributors"]
 
@@ -26,6 +26,7 @@ bytes = { version = "1", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive", "env"], optional = true }
 http = { version = "1", optional = true }
+hmac = { version = "0.12", optional = true }
 md5 = "0.7"
 mime_guess = "2"
 percent-encoding = "2"
@@ -35,6 +36,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 sha2 = "0.10"
+subtle = { version = "2", optional = true }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres"], optional = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "net", "signal", "sync", "time"], optional = true }
 tracing = { version = "0.1", optional = true }
@@ -56,9 +58,11 @@ server = [
     "dep:bytes",
     "dep:clap",
     "dep:http",
+    "dep:hmac",
     "dep:serde",
     "dep:serde_json",
     "dep:sqlx",
+    "dep:subtle",
     "dep:tokio",
     "dep:tracing",
     "dep:tracing-subscriber",

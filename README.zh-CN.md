@@ -101,6 +101,10 @@ Server CLI 参数：
 - `--storage-root`：对象内容落盘目录
 - `--log-level`：日志级别或 `tracing_subscriber` 过滤 directive，默认 `info`
 - `--max-upload-size`：上传 body 最大字节数，默认 `0` 表示禁用 axum body 限制
+- `--auth-enabled <true|false>`：显式开启或关闭鉴权，默认 `false`
+- `--service-token`：内部 `/s3` API 使用的 Bearer Token，默认为空
+- `--user-auth-secret`：只读 `/api/object` API 使用的 HMAC 密钥，默认为空
+- `--object-auth-cookie`：浏览器访问令牌的 Cookie 名称，默认 `alocals3-auth-cookie`
 - `--version`：输出 server 版本号和作者信息
 
 环境变量：
@@ -109,6 +113,112 @@ Server CLI 参数：
 - `ALOCALS3_STORAGE_ROOT`：默认 `./data`
 - `ALOCALS3_LOG_LEVEL`：默认 `info`
 - `ALOCALS3_MAX_UPLOAD_SIZE`：默认 `0`
+- `ALOCALS3_AUTH_ENABLED`：鉴权开关，默认 `false`；命令行参数优先
+- `ALOCALS3_SERVICE_TOKEN`：开启鉴权后 `/s3` 所需的 Bearer Token
+- `ALOCALS3_USER_AUTH_SECRET`：用于校验 `/api/object` Lauraycs 访问令牌的 HMAC 密钥
+- `ALOCALS3_OBJECT_AUTH_COOKIE`：访问令牌 Cookie 名称，默认 `alocals3-auth-cookie`
+
+### 鉴权机制
+
+鉴权状态由 `--auth-enabled <true|false>`（或 `ALOCALS3_AUTH_ENABLED`）显式控制，
+不再通过密钥是否为空隐式开启：
+
+- 设置 `--auth-enabled true` 后，`/s3` 要求
+  `Authorization: Bearer <service-token>`，`/api/object/{bucket}/{key}` 要求有效的
+  HMAC 用户令牌。此时 `--service-token` 和 `--user-auth-secret` 都是必填项，任一
+  为空时服务端会拒绝启动。
+- 设置 `--auth-enabled false`（默认值）后，两类 API 均可匿名访问。即使已经配置
+  Token 或密钥，也会在重新开启鉴权前保持忽略状态。
+- `/healthz` 不需要鉴权。
+
+开关与密钥都可以直接通过命令行参数设置：
+
+```bash
+SERVICE_TOKEN="$(openssl rand -hex 32)"
+USER_AUTH_SECRET="$(openssl rand -hex 32)"
+
+target/release/alocals3-server \
+  --auth-enabled true \
+  --service-token "$SERVICE_TOKEN" \
+  --user-auth-secret "$USER_AUTH_SECRET" \
+  --object-auth-cookie "alocals3-auth-cookie" \
+  --database-url "sqlite:///./alocals3.db" \
+  --storage-root ./data
+```
+
+也可以继续使用环境变量。后续示例假定启动服务和客户端前已导出相同的值：
+
+```bash
+export ALOCALS3_AUTH_ENABLED=true
+export ALOCALS3_SERVICE_TOKEN="$SERVICE_TOKEN"
+export ALOCALS3_USER_AUTH_SECRET="$USER_AUTH_SECRET"
+export ALOCALS3_OBJECT_AUTH_COOKIE="alocals3-auth-cookie" # 可选
+```
+
+开启后，可通过 curl 或 Python client 调用 `/s3`：
+
+```bash
+curl -H "Authorization: Bearer ${ALOCALS3_SERVICE_TOKEN}" \
+  http://127.0.0.1:8000/s3
+
+# CLI 和 Python client 也会自动读取 ALOCALS3_SERVICE_TOKEN。
+python -m alocals3.client --endpoint http://127.0.0.1:8000 LIST_BUCKETS
+```
+
+```python
+from alocals3.client import ALocalS3Client
+
+with ALocalS3Client(
+    "http://127.0.0.1:8000",
+    service_token="与服务端相同的-service-token",
+) as client:
+    print(client.list_buckets())
+```
+
+用户访问令牌格式为 `<payload>.<signature>`。`payload` 是
+`<username>|<access>|<expires-unix-seconds>|<nonce>` 的无填充 URL-safe Base64
+编码；`signature` 是使用 `ALOCALS3_USER_AUTH_SECRET` 对编码后 payload 计算的
+HMAC-SHA256 小写十六进制摘要。服务端要求 username 和 nonce 非空，并校验过期
+时间与签名；当前仅透传 `access` 字段，不会把它解释为授权规则。该令牌通常由
+Lauraycs 签发；下面的独立示例展示了准确的生成和调用格式：
+
+```bash
+USER_TOKEN="$(python - <<'PY'
+import base64, hashlib, hmac, os, secrets, time
+
+raw = f"demo-user|read|{int(time.time()) + 3600}|{secrets.token_hex(16)}"
+payload = base64.urlsafe_b64encode(raw.encode()).rstrip(b"=").decode()
+signature = hmac.new(
+    os.environ["ALOCALS3_USER_AUTH_SECRET"].encode(),
+    payload.encode(),
+    hashlib.sha256,
+).hexdigest()
+print(f"{payload}.{signature}")
+PY
+)"
+
+curl -H "Authorization: Bearer ${USER_TOKEN}" \
+  http://127.0.0.1:8000/api/object/demo/file.bin
+```
+
+浏览器也可以把同一个令牌放入 `ALOCALS3_OBJECT_AUTH_COOKIE` 指定的 Cookie，
+例如 `Cookie: alocals3-auth-cookie=<user-token>`。Bearer Header 与 Cookie 同时
+存在时，优先使用 Bearer Header。Amazon S3 没有定义鉴权 Cookie 名；SigV4 使用
+`Authorization` Header、查询参数或浏览器 POST 字段。因此
+`alocals3-auth-cookie` 是 alocals3 自定义名称，不属于 `x-amz-*` 协议字段。
+CloudFront 的签名 Cookie 需要三枚配套 Cookie，属于另一套协议，因此不复用其名称。
+
+如需关闭鉴权，用 `false` 重启服务即可；即使环境变量设置了
+`ALOCALS3_AUTH_ENABLED=true`，命令行参数也会覆盖它：
+
+```bash
+target/release/alocals3-server \
+  --auth-enabled false \
+  --database-url "sqlite:///./alocals3.db" \
+  --storage-root ./data
+```
+
+无鉴权模式只应在可信的本地开发环境中使用。
 
 连接串示例：
 
@@ -143,6 +253,7 @@ Bucket 名称、对象 key、prefix、delimiter、continuation token 都按 UTF-
 - `GET /s3/{bucket}/{key}`：下载对象
 - `HEAD /s3/{bucket}/{key}`：获取对象元信息
 - `DELETE /s3/{bucket}/{key}`：删除对象
+- `GET|HEAD /api/object/{bucket}/{key}`：需用户鉴权的只读浏览器对象访问
 
 支持的对象能力：
 

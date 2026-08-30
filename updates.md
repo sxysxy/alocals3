@@ -1,3 +1,10 @@
+# Version 0.9.1
+
+- Stream object downloads from disk in bounded 1 MiB chunks instead of buffering the full object
+- Serve byte ranges with direct file seek and length-limited reads
+- Release the response-owned file stream when a client disconnects
+- Bound buffering for the two public JSON compatibility transformations
+
 # Version 0.9.0
 
 - Add optional bearer-token authentication for the internal `/s3` API

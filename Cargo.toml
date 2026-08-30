@@ -1,6 +1,6 @@
 [package]
 name = "alocals3-rust"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 authors = ["alocals3 contributors"]
 
@@ -38,7 +38,8 @@ serde_json = { version = "1", optional = true }
 sha2 = "0.10"
 subtle = { version = "2", optional = true }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres"], optional = true }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "net", "signal", "sync", "time"], optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "net", "signal", "sync", "time"], optional = true }
+tokio-util = { version = "0.7", features = ["io"], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 uuid = { version = "1", features = ["v4"] }
@@ -64,6 +65,7 @@ server = [
     "dep:sqlx",
     "dep:subtle",
     "dep:tokio",
+    "dep:tokio-util",
     "dep:tracing",
     "dep:tracing-subscriber",
 ]

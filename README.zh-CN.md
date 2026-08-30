@@ -258,10 +258,17 @@ Bucket 名称、对象 key、prefix、delimiter、continuation token 都按 UTF-
 支持的对象能力：
 
 - `ETag` 是对象内容的 MD5 hex 摘要。
+- `GET` 以 1 MiB 分块从磁盘流式读取，不再把完整对象缓存在服务端内存中；
+  客户端断开并丢弃响应时，对应文件流也会被释放。
+- Range 请求会直接 seek 到指定偏移，只流式读取请求的字节数。
 - `Range` 请求返回 `206` 或 `416`。
 - `PUT` 支持 `If-None-Match` 和 `If-Match`。
 - `PUT` 支持 `Content-MD5` 校验。
 - `GET` 和 `HEAD` 支持 `If-None-Match`。
+
+面向浏览器的接口通常复用同一流式路径。只有 `*/3dtiles/tileset.json` 和
+`*/terrain/layer.json` 因为需要改写旧版兼容字段而进行内存缓冲，且缓冲上限为
+16 MiB。
 
 `PUT /s3/{bucket}/{key}` 返回：
 

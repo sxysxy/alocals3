@@ -23,13 +23,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use subtle::ConstantTimeEq;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::time::MissedTickBehavior;
+use tokio_util::io::ReaderStream;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 static HEALTH_COUNTER: AtomicUsize = AtomicUsize::new(1);
+const DOWNLOAD_CHUNK_SIZE: usize = 1024 * 1024;
+const PUBLIC_JSON_TRANSFORM_MAX_SIZE: u64 = 16 * 1024 * 1024;
 
 fn version_info() -> &'static str {
     concat!(
@@ -180,6 +183,12 @@ struct ObjectInfo {
 struct StoredObject {
     info: ObjectInfo,
     body: Vec<u8>,
+}
+
+struct StoredObjectSource {
+    info: ObjectInfo,
+    path: PathBuf,
+    size: u64,
 }
 
 #[derive(Serialize)]
@@ -835,11 +844,11 @@ async fn get_object(
     AxumPath((bucket, key)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    object_response(
-        state.storage.get_object(&bucket, &key).await?,
+    stream_object_response(
+        state.storage.get_object_source(&bucket, &key).await?,
         &headers,
-        true,
     )
+    .await
 }
 
 async fn get_public_object(
@@ -847,13 +856,46 @@ async fn get_public_object(
     AxumPath((bucket, key)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    let mut object = state.storage.get_object(&bucket, &key).await?;
-    prepare_public_object(&mut object);
-    let terrain_gzip = object.info.key.to_ascii_lowercase().ends_with(".terrain")
-        && object.body.starts_with(&[0x1f, 0x8b]);
-    let mut response = object_response(object, &headers, true)?;
+    let mut source = state.storage.get_object_source(&bucket, &key).await?;
+    let lower_key = source.info.key.to_ascii_lowercase();
+    source.info.content_type =
+        public_content_type(&lower_key, &source.info.content_type).to_string();
+    let terrain_gzip = lower_key.ends_with(".terrain") && file_starts_with_gzip(&source.path).await;
+    let mut response = if public_object_requires_transform(&lower_key) {
+        if source.size > PUBLIC_JSON_TRANSFORM_MAX_SIZE {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "Public JSON transformation is limited to {PUBLIC_JSON_TRANSFORM_MAX_SIZE} bytes"
+                ),
+            ));
+        }
+        let body = tokio::fs::read(&source.path)
+            .await
+            .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "Object data missing"))?;
+        let mut object = StoredObject {
+            info: source.info,
+            body,
+        };
+        prepare_public_object(&mut object);
+        object_response(object, &headers, true)?
+    } else {
+        stream_object_response(source, &headers).await?
+    };
     apply_public_object_headers(&mut response, &bucket, &key, terrain_gzip);
     Ok(response)
+}
+
+fn public_object_requires_transform(lower_key: &str) -> bool {
+    lower_key.ends_with("/3dtiles/tileset.json") || lower_key.ends_with("/terrain/layer.json")
+}
+
+async fn file_starts_with_gzip(path: &Path) -> bool {
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        return false;
+    };
+    let mut magic = [0_u8; 2];
+    file.read_exact(&mut magic).await.is_ok() && magic == [0x1f, 0x8b]
 }
 
 async fn head_object(
@@ -1397,18 +1439,35 @@ impl Storage {
         Ok((row.info(destination_bucket), retired_path))
     }
 
+    #[cfg(test)]
     async fn get_object(&self, bucket: &str, key: &str) -> ApiResult<StoredObject> {
+        let source = self.get_object_source(bucket, key).await?;
+        let body = tokio::fs::read(&source.path)
+            .await
+            .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "Object data missing"))?;
+        Ok(StoredObject {
+            info: source.info,
+            body,
+        })
+    }
+
+    async fn get_object_source(&self, bucket: &str, key: &str) -> ApiResult<StoredObjectSource> {
         validate_bucket(bucket)?;
         let normalized_key = normalize_key(key)?;
         let bucket_row = self.bucket_row(bucket).await?;
         let row = self.object_row(bucket_row.id, &normalized_key).await?;
-        let body = tokio::fs::read(self.objects_root().join(&row.file_path))
+        let path = self.objects_root().join(&row.file_path);
+        let metadata = tokio::fs::metadata(&path)
             .await
             .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "Object data missing"))?;
-        Ok(StoredObject {
-            info: row.info(bucket),
-            body,
-        })
+        if !metadata.is_file() {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "Object data missing"));
+        }
+        let size = metadata.len();
+        let mut info = row.info(bucket);
+        info.size = i64::try_from(size)
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Object too large"))?;
+        Ok(StoredObjectSource { info, path, size })
     }
 
     async fn get_object_info(&self, bucket: &str, key: &str) -> ApiResult<Option<ObjectInfo>> {
@@ -2029,6 +2088,72 @@ async fn init_pg(pool: &PgPool) -> anyhow::Result<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+async fn stream_object_response(
+    source: StoredObjectSource,
+    headers: &HeaderMap,
+) -> ApiResult<Response> {
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{}\"", source.info.etag)).unwrap(),
+    );
+    insert_user_metadata_headers(&mut response_headers, &source.info.metadata)?;
+    response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response_headers.insert(
+        header::LAST_MODIFIED,
+        HeaderValue::from_str(&http_date(&source.info.updated_at))
+            .unwrap_or_else(|_| HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT")),
+    );
+
+    if header_str(headers, header::IF_NONE_MATCH.as_str())
+        .map(|value| etag_matches(value, &source.info.etag))
+        .unwrap_or(false)
+    {
+        return Ok((StatusCode::NOT_MODIFIED, response_headers).into_response());
+    }
+
+    let body_len = usize::try_from(source.size)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Object too large"))?;
+    let (status, start, response_len) =
+        if let Some(range_header) = header_str(headers, header::RANGE.as_str()) {
+            let (start, end) = parse_range(range_header, body_len)?;
+            response_headers.insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes {start}-{end}/{body_len}")).unwrap(),
+            );
+            (StatusCode::PARTIAL_CONTENT, start, end - start + 1)
+        } else {
+            (StatusCode::OK, 0, body_len)
+        };
+    response_headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&response_len.to_string()).unwrap(),
+    );
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&source.info.content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+
+    let mut file = tokio::fs::File::open(&source.path)
+        .await
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "Object data missing"))?;
+    if start != 0 {
+        file.seek(std::io::SeekFrom::Start(start as u64))
+            .await
+            .map_err(|err| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to seek object data: {err}"),
+                )
+            })?;
+    }
+    let reader = file.take(response_len as u64);
+    let stream = ReaderStream::with_capacity(reader, DOWNLOAD_CHUNK_SIZE);
+    let body = Body::from_stream(stream);
+    Ok((status, response_headers, body).into_response())
 }
 
 fn object_response(
@@ -2656,6 +2781,69 @@ mod tests {
             .get_object("test-bucket", "large.glb")
             .await
             .is_err());
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streamed_object_response_supports_full_and_range_reads() {
+        let (storage, root) = test_storage().await;
+        let payload = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let (info, _, _) = storage
+            .put_object(
+                "test-bucket",
+                "stream.bin",
+                payload,
+                Some("application/octet-stream"),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let response = stream_object_response(
+            storage
+                .get_object_source("test-bucket", "stream.bin")
+                .await
+                .unwrap(),
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH],
+            payload.len().to_string()
+        );
+        assert_eq!(
+            response.headers()[header::ETAG],
+            format!("\"{}\"", info.etag)
+        );
+        let body = axum::body::to_bytes(response.into_body(), payload.len())
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), payload);
+
+        let mut range_headers = HeaderMap::new();
+        range_headers.insert(header::RANGE, HeaderValue::from_static("bytes=10-19"));
+        let response = stream_object_response(
+            storage
+                .get_object_source("test-bucket", "stream.bin")
+                .await
+                .unwrap(),
+            &range_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "10");
+        assert_eq!(
+            response.headers()[header::CONTENT_RANGE],
+            format!("bytes 10-19/{}", payload.len())
+        );
+        let body = axum::body::to_bytes(response.into_body(), 10)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), &payload[10..20]);
+
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 

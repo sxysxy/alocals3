@@ -267,10 +267,19 @@ Object keys, bucket names, prefixes, delimiters, and continuation tokens are UTF
 Supported object features:
 
 - `ETag` is the MD5 hex digest of the object body.
+- `GET` streams object data from disk in 1 MiB chunks. The server does not
+  buffer the complete object, and dropping a disconnected client's response
+  also drops its file stream.
+- Range requests seek directly to the requested offset and stream only the
+  selected byte count.
 - `Range` requests return `206` or `416`.
 - `If-None-Match` and `If-Match` are supported for `PUT`.
 - `Content-MD5` is validated on `PUT`.
 - `If-None-Match` is supported for `GET` and `HEAD`.
+
+The browser-facing endpoint normally uses the same streaming path. Only
+`*/3dtiles/tileset.json` and `*/terrain/layer.json` are buffered because their
+legacy compatibility fields may be rewritten; this buffer is capped at 16 MiB.
 
 `PUT /s3/{bucket}/{key}` returns:
 

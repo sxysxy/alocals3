@@ -102,7 +102,8 @@ Server CLI flags:
 - `--database-url`: SQLite or PostgreSQL URL
 - `--storage-root`: object payload root directory
 - `--log-level`: log level or `tracing_subscriber` filter directive, default `info`
-- `--max-upload-size`: maximum upload body size in bytes, default `0` disables the axum body limit
+- `--max-upload-size`: maximum upload body size in bytes, enforced while streaming; default `0` means unlimited
+- `--max-concurrent-uploads`: maximum number of request bodies concurrently streaming to disk, default `16`
 - `--auth-enabled <true|false>`: explicitly enable or disable authentication, default `false`
 - `--service-token`: bearer token for the internal `/s3` API; empty by default
 - `--user-auth-secret`: HMAC secret for the read-only `/api/object` API; empty by default
@@ -115,6 +116,7 @@ Environment variables:
 - `ALOCALS3_STORAGE_ROOT`: default `./data`
 - `ALOCALS3_LOG_LEVEL`: default `info`
 - `ALOCALS3_MAX_UPLOAD_SIZE`: default `0`
+- `ALOCALS3_MAX_CONCURRENT_UPLOADS`: default `16`
 - `ALOCALS3_AUTH_ENABLED`: authentication switch, default `false`; the CLI flag takes precedence
 - `ALOCALS3_SERVICE_TOKEN`: bearer token required by `/s3` when authentication is enabled
 - `ALOCALS3_USER_AUTH_SECRET`: HMAC secret used to validate Lauraycs access tokens on `/api/object`
@@ -238,7 +240,7 @@ Use an absolute SQLite path in scripts and services to avoid accidentally writin
 
 Logging is written to stderr. Common levels are `debug`, `info`, `warn`, and `error`; full `EnvFilter` directives such as `warn,alocals3_server=debug` are also accepted.
 
-Uploads are not capped by the server body extractor by default. The current implementation buffers each uploaded object in memory before writing it to disk, so practical limits are still determined by process memory and available storage. Set `--max-upload-size` to restore an explicit byte limit.
+PUT request bodies are streamed to temporary files while MD5 and SHA-256 are calculated incrementally, so memory use does not grow with object size. Completed uploads are synced and atomically moved into the content-addressed blob layout before metadata is committed. `--max-concurrent-uploads` bounds active upload streams, and `--max-upload-size` is enforced for both fixed-length and chunked requests.
 
 ## Storage Layout
 
@@ -373,7 +375,7 @@ Set `disable_proxy=True` or pass `--disable-proxy` to ignore proxy environment v
 - Read modes (`"rb"` / `"r"`) create a Rust-backed streaming HTTP reader. `open()` sends the request and reads response headers, but object bytes are pulled from the network when the returned file object's `read()` path runs.
 - Write modes (`"wb"` / `"w"`) spool writes to a Rust-owned temporary file. The HTTP `PUT` is sent when the file is closed or the `with` block exits successfully. If the `with` block exits with an exception, the upload is discarded.
 - `cache_path=` is best-effort and is populated as bytes pass through the file-like object; cache write failures do not fail the network operation.
-- For asyncio code, `ALocalS3ClientAsync.open()` returns an async file-like object for `async with`. It provides awaitable `read()`, `readline()`, `readinto()`, `write()`, `flush()`, `close()`, and `discard()` methods backed by the same Rust implementation.
+- `ALocalS3ClientAsync` is backed by native Tokio/reqwest futures exposed through PyO3; it does not dispatch the synchronous client through `asyncio.to_thread()`. Its `open()` method returns an async file-like object for `async with` with awaitable `read()`, `readline()`, `readinto()`, `write()`, `flush()`, `close()`, and `discard()` methods.
 
 Benchmark the Python file-like API with a large object:
 
@@ -385,6 +387,12 @@ Validate stream multiplexing and Range-based resume reads:
 
 ```bash
 ./examples/benchmark_stream_multiplex.sh
+```
+
+Stress the native async client itself:
+
+```bash
+python examples/bench_async_client.py --duration 30 --concurrency 50 --disable-proxy
 ```
 
 The current file-like API supports resume reads through `range_header="bytes=N-"`. Upload resume is not implemented yet; write modes spool to a Rust-owned temporary file and use one HTTP `PUT` on close.

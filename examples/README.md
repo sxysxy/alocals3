@@ -181,3 +181,15 @@ writer_close_upload: health failures=0, p95=3.956 ms
 ```
 
 当前支持断点续读（Range GET）。写入侧 file-like API 当前是 Rust 临时文件 spool 后单次 PUT；如果上传 TCP 会话在 `close()` 期间中断，需要重新 PUT。断点续写/断点续传上传需要额外的 multipart 或 upload-session 协议。
+
+## 9) 原生 PyO3 async 客户端压力测试
+
+```bash
+python examples/bench_async_client.py \
+  --endpoint http://127.0.0.1:8000 \
+  --duration 30 \
+  --concurrency 50 \
+  --disable-proxy
+```
+
+该脚本直接使用 `ALocalS3ClientAsync` 并发执行 PUT/GET，校验响应内容，同时记录吞吐、P50/P95/P99 延迟和 asyncio event-loop heartbeat 最大间隔。

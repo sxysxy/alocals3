@@ -1,5 +1,5 @@
-use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
+use axum::body::Body;
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
@@ -8,6 +8,7 @@ use axum::{Json, Router};
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::Parser;
+use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use percent_encoding::percent_decode_str;
 use serde::Serialize;
@@ -24,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::MissedTickBehavior;
 use tokio_util::io::ReaderStream;
 use tracing_subscriber::EnvFilter;
@@ -33,6 +34,7 @@ use uuid::Uuid;
 static HEALTH_COUNTER: AtomicUsize = AtomicUsize::new(1);
 const DOWNLOAD_CHUNK_SIZE: usize = 1024 * 1024;
 const PUBLIC_JSON_TRANSFORM_MAX_SIZE: u64 = 16 * 1024 * 1024;
+const DEFAULT_MAX_CONCURRENT_UPLOADS: usize = 16;
 
 fn version_info() -> &'static str {
     concat!(
@@ -66,6 +68,12 @@ struct Args {
     log_level: String,
     #[arg(long, env = "ALOCALS3_MAX_UPLOAD_SIZE", default_value_t = 0)]
     max_upload_size: usize,
+    #[arg(
+        long,
+        env = "ALOCALS3_MAX_CONCURRENT_UPLOADS",
+        default_value_t = DEFAULT_MAX_CONCURRENT_UPLOADS
+    )]
+    max_concurrent_uploads: usize,
     #[arg(long, env = "ALOCALS3_DISABLE_GC", default_value_t = false)]
     disable_gc: bool,
     #[arg(long, env = "ALOCALS3_GC_INTERVAL_SECS", default_value_t = 300)]
@@ -98,6 +106,8 @@ struct AppState {
     storage: Arc<Storage>,
     gc: Option<Arc<GarbageCollector>>,
     auth: Arc<AuthConfig>,
+    max_upload_size: usize,
+    upload_semaphore: Arc<Semaphore>,
 }
 
 struct AuthConfig {
@@ -189,6 +199,43 @@ struct StoredObjectSource {
     info: ObjectInfo,
     path: PathBuf,
     size: u64,
+}
+
+struct StagedUpload {
+    temp_path: PathBuf,
+    size: i64,
+    etag: String,
+    sha256: String,
+}
+
+impl Drop for StagedUpload {
+    fn drop(&mut self) {
+        if !self.temp_path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
+    }
+}
+
+struct TempFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn into_path(mut self) -> PathBuf {
+        self.path.take().expect("temporary upload path is present")
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -372,7 +419,8 @@ async fn request_logging(request: Request<Body>, next: Next) -> Response {
 
     if path == "/healthz" {
         let hit = HEALTH_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let sampled = status.is_client_error() || status.is_server_error() || hit % 30 == 0;
+        let sampled =
+            status.is_client_error() || status.is_server_error() || hit.is_multiple_of(30);
         if sampled {
             log_by_status(
                 status,
@@ -562,6 +610,7 @@ async fn main() -> anyhow::Result<()> {
         database_backend = database_backend(&args.database_url),
         storage_root = %args.storage_root.display(),
         max_upload_size = args.max_upload_size,
+        max_concurrent_uploads = args.max_concurrent_uploads.max(1),
         disable_gc = args.disable_gc,
         gc_interval_secs = args.gc_interval_secs,
         gc_grace_secs = args.gc_grace_secs,
@@ -581,11 +630,6 @@ async fn main() -> anyhow::Result<()> {
             Duration::from_secs(args.gc_start_delay_secs),
         ))
     };
-    let body_limit = if args.max_upload_size == 0 {
-        DefaultBodyLimit::disable()
-    } else {
-        DefaultBodyLimit::max(args.max_upload_size)
-    };
     let state = AppState {
         storage,
         gc,
@@ -595,6 +639,8 @@ async fn main() -> anyhow::Result<()> {
             user_auth_secret: args.user_auth_secret,
             object_auth_cookie: args.object_auth_cookie,
         }),
+        max_upload_size: args.max_upload_size,
+        upload_semaphore: Arc::new(Semaphore::new(args.max_concurrent_uploads.max(1))),
     };
     let app = Router::new()
         .route("/healthz", get(health))
@@ -617,7 +663,6 @@ async fn main() -> anyhow::Result<()> {
             "/api/object/:bucket/*key",
             get(get_public_object).head(head_public_object),
         )
-        .layer(body_limit)
         .layer(from_fn_with_state(state.clone(), request_authorization))
         .layer(from_fn(request_logging))
         .with_state(state);
@@ -730,7 +775,7 @@ async fn put_object(
     AxumPath((bucket, key)): AxumPath<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> ApiResult<Response> {
     if let Some(copy_source) = header_str(&headers, "x-amz-copy-source") {
         let (source_bucket, source_key) = parse_copy_source(copy_source)?;
@@ -787,7 +832,8 @@ async fn put_object(
         return Ok(response);
     }
 
-    validate_content_md5(&headers, &body)?;
+    validate_content_length(&headers, state.max_upload_size)?;
+    let expected_md5 = parse_content_md5(&headers)?;
     let existing = state.storage.get_object_info(&bucket, &key).await?;
 
     if let Some(value) = header_str(&headers, header::IF_NONE_MATCH.as_str()) {
@@ -801,11 +847,10 @@ async fn put_object(
         }
     }
     if let Some(value) = header_str(&headers, header::IF_MATCH.as_str()) {
-        if existing
+        if !existing
             .as_ref()
             .map(|info| etag_matches(value, &info.etag))
             .unwrap_or(false)
-            == false
         {
             return Err(ApiError::new(
                 StatusCode::PRECONDITION_FAILED,
@@ -816,9 +861,22 @@ async fn put_object(
 
     let content_type = header_str(&headers, header::CONTENT_TYPE.as_str()).map(str::to_string);
     let metadata = extract_user_metadata(&headers)?;
+    let _upload_permit = state.upload_semaphore.acquire().await.map_err(|_| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Upload service unavailable",
+        )
+    })?;
+    let staged = stage_upload(
+        &state.storage.objects_root(),
+        body,
+        state.max_upload_size,
+        expected_md5,
+    )
+    .await?;
     let (info, created, retired_path) = state
         .storage
-        .put_object(&bucket, &key, &body, content_type.as_deref(), metadata)
+        .put_staged_object(&bucket, &key, staged, content_type.as_deref(), metadata)
         .await?;
     if let (Some(gc), Some(path)) = (&state.gc, retired_path) {
         gc.reclaim_path(path);
@@ -1291,11 +1349,11 @@ impl Storage {
         })
     }
 
-    async fn put_object(
+    async fn put_staged_object(
         &self,
         bucket: &str,
         key: &str,
-        body: &[u8],
+        mut staged: StagedUpload,
         content_type: Option<&str>,
         metadata: HashMap<String, String>,
     ) -> ApiResult<(ObjectInfo, bool, Option<String>)> {
@@ -1306,13 +1364,16 @@ impl Storage {
             .object_row_optional(bucket_row.id, &normalized_key)
             .await?
             .map(|row| row.file_path);
-        let etag = format!("{:x}", md5::compute(body));
-        let digest = hex_sha256(body);
-        let relative_path = format!("{}/{}/{}", &digest[..2], &digest[2..4], digest);
+        let relative_path = format!(
+            "{}/{}/{}",
+            &staged.sha256[..2],
+            &staged.sha256[2..4],
+            staged.sha256
+        );
         self.register_active_write(&relative_path).await;
         let result = async {
             let objects_root = self.objects_root();
-            atomic_write_blob(&objects_root.join(&relative_path), body).await?;
+            install_staged_blob(&mut staged, &objects_root.join(&relative_path)).await?;
             let now = now_utc();
             let final_content_type = content_type.map(str::to_string).unwrap_or_else(|| {
                 mime_guess::from_path(&normalized_key)
@@ -1325,9 +1386,9 @@ impl Storage {
                     bucket_row.id,
                     &normalized_key,
                     &relative_path,
-                    body.len() as i64,
+                    staged.size,
                     &final_content_type,
-                    &etag,
+                    &staged.etag,
                     &now,
                     &metadata,
                 )
@@ -1339,6 +1400,20 @@ impl Storage {
         .await;
         self.unregister_active_write(&relative_path).await;
         result
+    }
+
+    #[cfg(test)]
+    async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+        metadata: HashMap<String, String>,
+    ) -> ApiResult<(ObjectInfo, bool, Option<String>)> {
+        let staged = stage_upload(&self.objects_root(), Body::from(body.to_vec()), 0, None).await?;
+        self.put_staged_object(bucket, key, staged, content_type, metadata)
+            .await
     }
 
     async fn copy_object(
@@ -1624,7 +1699,7 @@ impl Storage {
             }
         }
 
-        pending_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+        pending_dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
         for dir in pending_dirs {
             match tokio::fs::remove_dir(&dir).await {
                 Ok(()) => report.empty_dirs_removed += 1,
@@ -1876,6 +1951,7 @@ impl Storage {
         Ok(rows_affected)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn upsert_object(
         &self,
         bucket_id: i64,
@@ -2360,18 +2436,42 @@ fn is_stale_tmp_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn validate_content_md5(headers: &HeaderMap, body: &[u8]) -> ApiResult<()> {
-    let Some(value) = header_str(headers, "content-md5") else {
+fn validate_content_length(headers: &HeaderMap, max_upload_size: usize) -> ApiResult<()> {
+    if max_upload_size == 0 {
+        return Ok(());
+    }
+    let Some(value) = headers.get(header::CONTENT_LENGTH) else {
         return Ok(());
     };
+    let value = value
+        .to_str()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid Content-Length header"))?;
+    let length = value
+        .parse::<u64>()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid Content-Length header"))?;
+    if length > max_upload_size as u64 {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("Upload exceeds maximum size of {max_upload_size} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_content_md5(headers: &HeaderMap) -> ApiResult<Option<[u8; 16]>> {
+    let Some(value) = headers.get("content-md5") else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid Content-MD5 header"))?;
     let provided = base64::engine::general_purpose::STANDARD
         .decode(value)
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid Content-MD5 header"))?;
-    let actual = md5::compute(body);
-    if provided != actual.0 {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "BadDigest"));
-    }
-    Ok(())
+    let provided = provided
+        .try_into()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Invalid Content-MD5 header"))?;
+    Ok(Some(provided))
 }
 
 fn extract_user_metadata(headers: &HeaderMap) -> ApiResult<HashMap<String, String>> {
@@ -2489,29 +2589,95 @@ fn range_error(total_size: usize) -> ApiError {
     )
 }
 
-async fn atomic_write_blob(target_path: &Path, body: &[u8]) -> ApiResult<()> {
+async fn stage_upload(
+    objects_root: &Path,
+    body: Body,
+    max_upload_size: usize,
+    expected_md5: Option<[u8; 16]>,
+) -> ApiResult<StagedUpload> {
+    tokio::fs::create_dir_all(objects_root).await?;
+    let temp_path = objects_root.join(format!(".upload-{}.tmp", Uuid::new_v4().simple()));
+    let guard = TempFileGuard::new(temp_path.clone());
+    let mut file = tokio::fs::File::create(&temp_path).await?;
+    let mut stream = body.into_data_stream();
+    let mut md5_context = md5::Context::new();
+    let mut sha256 = Sha256::new();
+    let mut size = 0_usize;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read request body: {err}"),
+            )
+        })?;
+        size = size
+            .checked_add(chunk.len())
+            .ok_or_else(|| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "Upload size overflow"))?;
+        if max_upload_size != 0 && size > max_upload_size {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Upload exceeds maximum size of {max_upload_size} bytes"),
+            ));
+        }
+        md5_context.consume(&chunk);
+        sha256.update(&chunk);
+        file.write_all(&chunk).await?;
+    }
+
+    file.sync_all().await?;
+    drop(file);
+    let md5 = md5_context.compute();
+    if expected_md5
+        .map(|expected| expected != md5.0)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "BadDigest"));
+    }
+    let size = i64::try_from(size)
+        .map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "Upload is too large"))?;
+    Ok(StagedUpload {
+        temp_path: guard.into_path(),
+        size,
+        etag: format!("{md5:x}"),
+        sha256: format!("{:x}", sha256.finalize()),
+    })
+}
+
+async fn install_staged_blob(staged: &mut StagedUpload, target_path: &Path) -> ApiResult<()> {
     if let Some(parent) = target_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let tmp_path = target_path.with_file_name(format!(
-        ".{}.{}.tmp",
-        target_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("blob"),
-        Uuid::new_v4().simple()
-    ));
-    let mut file = tokio::fs::File::create(&tmp_path).await?;
-    file.write_all(body).await?;
-    file.sync_all().await?;
-    tokio::fs::rename(&tmp_path, target_path).await?;
-    Ok(())
-}
+    match tokio::fs::metadata(target_path).await {
+        Ok(metadata) if metadata.is_file() => {
+            tokio::fs::remove_file(&staged.temp_path).await?;
+            staged.temp_path.clear();
+            return Ok(());
+        }
+        Ok(_) => {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Object blob path is not a file",
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
 
-fn hex_sha256(body: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(body);
-    format!("{:x}", hasher.finalize())
+    match tokio::fs::rename(&staged.temp_path, target_path).await {
+        Ok(()) => staged.temp_path.clear(),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            match tokio::fs::metadata(target_path).await {
+                Ok(metadata) if metadata.is_file() => {
+                    tokio::fs::remove_file(&staged.temp_path).await?;
+                    staged.temp_path.clear();
+                }
+                _ => return Err(err.into()),
+            }
+        }
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
 }
 
 fn now_utc() -> String {
@@ -2916,6 +3082,55 @@ mod tests {
 
         let response = object_head_response(copied, &HeaderMap::new()).unwrap();
         assert_eq!(response.headers()["x-amz-meta-foo"], "new");
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_body_is_staged_incrementally_with_both_digests() {
+        let root = std::env::temp_dir().join(format!("alocals3-stage-{}", Uuid::new_v4()));
+        let payload = b"first chunk-second chunk";
+        let expected_md5 = md5::compute(payload);
+        let chunks = futures_util::stream::iter([
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"first chunk-")),
+            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"second chunk")),
+        ]);
+
+        let staged = stage_upload(
+            &root,
+            Body::from_stream(chunks),
+            payload.len(),
+            Some(expected_md5.0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(staged.size, payload.len() as i64);
+        assert_eq!(staged.etag, format!("{expected_md5:x}"));
+        assert_eq!(staged.sha256, format!("{:x}", Sha256::digest(payload)));
+        assert_eq!(tokio::fs::read(&staged.temp_path).await.unwrap(), payload);
+        let temp_path = staged.temp_path.clone();
+        drop(staged);
+        assert!(!temp_path.exists());
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_or_bad_digest_upload_removes_staging_file() {
+        let root = std::env::temp_dir().join(format!("alocals3-stage-{}", Uuid::new_v4()));
+        let oversized = stage_upload(&root, Body::from("too large"), 3, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(oversized.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+        let bad_digest = stage_upload(&root, Body::from("payload"), 0, Some([0; 16]))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(bad_digest.status, StatusCode::BAD_REQUEST);
+        assert_eq!(bad_digest.detail, "BadDigest");
+
+        let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_none());
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

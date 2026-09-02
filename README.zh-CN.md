@@ -100,7 +100,8 @@ Server CLI 参数：
 - `--database-url`：SQLite 或 PostgreSQL 连接串
 - `--storage-root`：对象内容落盘目录
 - `--log-level`：日志级别或 `tracing_subscriber` 过滤 directive，默认 `info`
-- `--max-upload-size`：上传 body 最大字节数，默认 `0` 表示禁用 axum body 限制
+- `--max-upload-size`：上传 body 最大字节数，在流式接收过程中执行；默认 `0` 表示不限制
+- `--max-concurrent-uploads`：同时流式写盘的上传请求数上限，默认 `16`
 - `--auth-enabled <true|false>`：显式开启或关闭鉴权，默认 `false`
 - `--service-token`：内部 `/s3` API 使用的 Bearer Token，默认为空
 - `--user-auth-secret`：只读 `/api/object` API 使用的 HMAC 密钥，默认为空
@@ -113,6 +114,7 @@ Server CLI 参数：
 - `ALOCALS3_STORAGE_ROOT`：默认 `./data`
 - `ALOCALS3_LOG_LEVEL`：默认 `info`
 - `ALOCALS3_MAX_UPLOAD_SIZE`：默认 `0`
+- `ALOCALS3_MAX_CONCURRENT_UPLOADS`：默认 `16`
 - `ALOCALS3_AUTH_ENABLED`：鉴权开关，默认 `false`；命令行参数优先
 - `ALOCALS3_SERVICE_TOKEN`：开启鉴权后 `/s3` 所需的 Bearer Token
 - `ALOCALS3_USER_AUTH_SECRET`：用于校验 `/api/object` Lauraycs 访问令牌的 HMAC 密钥
@@ -229,7 +231,7 @@ target/release/alocals3-server \
 
 日志输出到 stderr。常用级别包括 `debug`、`info`、`warn`、`error`；也支持完整 `EnvFilter` directive，例如 `warn,alocals3_server=debug`。
 
-默认情况下，server 不再使用 axum 的 body extractor 上传大小限制。当前实现会先把每个上传对象整体读入内存再写入磁盘，所以实际可上传大小仍受进程内存和可用磁盘限制。如果需要显式限制上传大小，可以设置 `--max-upload-size`。
+PUT 请求体会直接流式写入临时文件，同时增量计算 MD5 和 SHA-256，因此内存占用不会随对象大小增长。上传完成后先同步文件并原子移动到内容寻址目录，再提交数据库元数据。`--max-concurrent-uploads` 限制同时进行的上传流数量，`--max-upload-size` 对固定长度和 chunked 请求都会在流式接收过程中生效。
 
 ## 存储布局
 
@@ -351,7 +353,7 @@ alocals3-migrate2pg \
 - 读模式（`"rb"` / `"r"`）会创建 Rust 持有的流式 HTTP reader。`open()` 会发起请求并读取响应头，但对象 body 会在返回文件对象的 `read()` 路径中按需从网络读取。
 - 写模式（`"wb"` / `"w"`）会把 `write()` 数据写入 Rust 持有的临时文件；正常 `close()` 或正常退出 `with` 时才发送 HTTP `PUT`。如果 `with` 块内抛异常，则丢弃上传。
 - `cache_path=` 是 best-effort，会在数据经过 file-like 对象时同步写入；cache 写失败不会导致网络读写失败。
-- asyncio 代码里使用 `ALocalS3ClientAsync.open()` 和 `async with`。返回的是 async file-like 对象，提供可 `await` 的 `read()`、`readline()`、`readinto()`、`write()`、`flush()`、`close()`、`discard()` 方法，底层复用同一套 Rust 实现。
+- `ALocalS3ClientAsync` 由 Tokio/异步 reqwest 的原生 Future 通过 PyO3 暴露，不再用 `asyncio.to_thread()` 调度同步客户端。它的 `open()` 返回可用于 `async with` 的 async file-like 对象，提供可 `await` 的 `read()`、`readline()`、`readinto()`、`write()`、`flush()`、`close()`、`discard()` 方法。
 
 可以用大对象 benchmark 验证 Python file-like API：
 
@@ -363,6 +365,12 @@ alocals3-migrate2pg \
 
 ```bash
 ./examples/benchmark_stream_multiplex.sh
+```
+
+可以直接对原生异步客户端做并发压力测试：
+
+```bash
+python examples/bench_async_client.py --duration 30 --concurrency 50 --disable-proxy
 ```
 
 当前 file-like API 支持通过 `range_header="bytes=N-"` 断点续读。上传断点续传尚未实现；写模式会先写入 Rust 持有的临时文件，并在 `close()` 时用一次 HTTP `PUT` 上传。

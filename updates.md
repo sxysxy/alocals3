@@ -1,3 +1,10 @@
+# Version 0.9.2
+
+- Add a native Tokio/PyO3 async Python client without `asyncio.to_thread`
+- Stream PUT request bodies directly to temporary files with incremental MD5 and SHA-256 hashing
+- Bound concurrent uploads with `--max-concurrent-uploads` / `ALOCALS3_MAX_CONCURRENT_UPLOADS`
+- Enforce upload size limits while streaming, including chunked requests
+
 # Version 0.9.1
 
 - Stream object downloads from disk in bounded 1 MiB chunks instead of buffering the full object

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import codecs
 import io
 import json
 import sys
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from alocals3._alocals3_native import RustHttpClient
+from alocals3._alocals3_native import RustHttpClient, RustHttpClientAsync
 
 class ALocalS3Client:
     def __init__(
@@ -184,12 +185,7 @@ class ALocalS3ClientAsync:
         disable_proxy: bool = False,
         service_token: str | None = None,
     ) -> None:
-        self._sync = ALocalS3Client(
-            base_url=base_url,
-            timeout=timeout,
-            disable_proxy=disable_proxy,
-            service_token=service_token,
-        )
+        self._client = RustHttpClientAsync(base_url, timeout, disable_proxy, service_token)
 
     async def __aenter__(self) -> "ALocalS3ClientAsync":
         return self
@@ -198,19 +194,19 @@ class ALocalS3ClientAsync:
         await self.close()
 
     async def health(self) -> dict:
-        return await asyncio.to_thread(self._sync.health)
+        return _loads(await self._client.health_json())
 
     async def list_buckets(self) -> list[dict]:
-        return await asyncio.to_thread(self._sync.list_buckets)
+        return _loads(await self._client.list_buckets_json())
 
     async def create_bucket(self, bucket: str) -> dict:
-        return await asyncio.to_thread(self._sync.create_bucket, bucket)
+        return _loads(await self._client.create_bucket_json(bucket))
 
     async def delete_bucket(self, bucket: str) -> None:
-        await asyncio.to_thread(self._sync.delete_bucket, bucket)
+        await self._client.delete_bucket(bucket)
 
     async def list_objects(self, bucket: str, prefix: str | None = None, limit: int = 1000) -> list[dict]:
-        return await asyncio.to_thread(self._sync.list_objects, bucket, prefix, limit)
+        return _loads(await self._client.list_objects_json(bucket, prefix, limit))
 
     async def list_objects_v2(
         self,
@@ -220,13 +216,10 @@ class ALocalS3ClientAsync:
         max_keys: int = 1000,
         continuation_token: str | None = None,
     ) -> dict:
-        return await asyncio.to_thread(
-            self._sync.list_objects_v2,
-            bucket,
-            prefix,
-            delimiter,
-            max_keys,
-            continuation_token,
+        return _loads(
+            await self._client.list_objects_v2_json(
+                bucket, prefix, delimiter, max_keys, continuation_token
+            )
         )
 
     async def put_object(
@@ -237,7 +230,7 @@ class ALocalS3ClientAsync:
         content_type: str | None = None,
         metadata: dict[str, str] | None = None,
     ) -> dict:
-        return await asyncio.to_thread(self._sync.put_object, bucket, key, file_path, content_type, metadata)
+        return _loads(await self._client.put_object_json(bucket, key, str(file_path), content_type, metadata))
 
     async def put_object_bytes(
         self,
@@ -247,16 +240,18 @@ class ALocalS3ClientAsync:
         content_type: str | None = None,
         metadata: dict[str, str] | None = None,
     ) -> dict:
-        return await asyncio.to_thread(self._sync.put_object_bytes, bucket, key, body, content_type, metadata)
+        return _loads(
+            await self._client.put_object_bytes_json(bucket, key, bytes(body), content_type, metadata)
+        )
 
     async def get_object(self, bucket: str, key: str, output_path: Path) -> None:
-        await asyncio.to_thread(self._sync.get_object, bucket, key, output_path)
+        await self._client.get_object_to_file(bucket, key, str(output_path), None)
 
     async def get_object_bytes(self, bucket: str, key: str, range_header: str | None = None) -> tuple[bytes, dict]:
-        return await asyncio.to_thread(self._sync.get_object_bytes, bucket, key, range_header)
+        return await self._client.get_object_bytes(bucket, key, range_header)
 
     async def get_object_range(self, bucket: str, key: str, range_header: str) -> tuple[bytes, dict]:
-        return await asyncio.to_thread(self._sync.get_object_range, bucket, key, range_header)
+        return await self._client.get_object_bytes(bucket, key, range_header)
 
     async def get_object_to_file(
         self,
@@ -265,10 +260,10 @@ class ALocalS3ClientAsync:
         output_path: Path,
         range_header: str | None = None,
     ) -> dict:
-        return await asyncio.to_thread(self._sync.get_object_to_file, bucket, key, output_path, range_header)
+        return await self._client.get_object_to_file(bucket, key, str(output_path), range_header)
 
     async def delete_object(self, bucket: str, key: str) -> None:
-        await asyncio.to_thread(self._sync.delete_object, bucket, key)
+        await self._client.delete_object(bucket, key)
 
     async def copy_object(
         self,
@@ -281,15 +276,16 @@ class ALocalS3ClientAsync:
         metadata_directive: str | None = None,
         content_type: str | None = None,
     ) -> dict:
-        return await asyncio.to_thread(
-            self._sync.copy_object,
-            source_bucket,
-            source_key,
-            destination_bucket,
-            destination_key,
-            metadata=metadata,
-            metadata_directive=metadata_directive,
-            content_type=content_type,
+        return _loads(
+            await self._client.copy_object_json(
+                source_bucket,
+                source_key,
+                destination_bucket,
+                destination_key,
+                metadata,
+                metadata_directive,
+                content_type,
+            )
         )
 
     def open(
@@ -305,7 +301,7 @@ class ALocalS3ClientAsync:
         range_header: str | None = None,
     ):
         return _AsyncS3OpenContext(
-            self._sync,
+            self._client,
             url,
             mode,
             encoding=encoding,
@@ -317,7 +313,7 @@ class ALocalS3ClientAsync:
         )
 
     async def close(self) -> None:
-        self._sync.close()
+        return None
 
     async def aclose(self) -> None:
         await self.close()
@@ -550,7 +546,7 @@ class _S3StreamingTextWriter:
 class _AsyncS3OpenContext:
     def __init__(
         self,
-        client: ALocalS3Client,
+        client,
         url: str,
         mode: str,
         *,
@@ -585,72 +581,111 @@ class _AsyncS3OpenContext:
             self._file = None
 
     async def _open(self):
-        file_obj = await asyncio.to_thread(
-            self._client.open,
-            self._url,
-            self._mode,
+        bucket, key = _parse_object_url(self._url)
+        mode_info = _parse_mode(self._mode)
+        cache_path = str(self._cache_path) if self._cache_path is not None else None
+        if mode_info["read"]:
+            native = await self._client.open_object_reader(
+                bucket, key, self._range_header, cache_path
+            )
+        else:
+            if self._range_header is not None:
+                raise ValueError("range_header is only supported for read modes")
+            native = await self._client.open_object_writer(
+                bucket, key, self._content_type, cache_path
+            )
+        return _AsyncS3File(
+            native,
+            bucket=bucket,
+            key=key,
+            reading=mode_info["read"],
+            binary=mode_info["binary"],
             encoding=self._encoding,
             errors=self._errors,
             newline=self._newline,
-            content_type=self._content_type,
-            cache_path=self._cache_path,
-            range_header=self._range_header,
         )
-        return _AsyncS3File(file_obj)
 
 
 class _AsyncS3File:
-    def __init__(self, file_obj) -> None:
-        self._file = file_obj
+    def __init__(
+        self,
+        native,
+        *,
+        bucket: str,
+        key: str,
+        reading: bool,
+        binary: bool,
+        encoding: str,
+        errors: str | None,
+        newline: str | None,
+    ) -> None:
+        self._native = native
+        self.bucket = bucket
+        self.key = key
+        self._reading = reading
+        self._binary = binary
+        self.encoding = encoding
+        self.errors = errors or "strict"
+        self.newline = newline
+        self.result: dict | None = None
         self._lock = asyncio.Lock()
+        self._text_buffer = ""
+        self._text_eof = False
+        decoder = codecs.getincrementaldecoder(encoding)(errors=self.errors)
+        self._decoder = io.IncrementalNewlineDecoder(decoder, translate=newline is None)
 
     @property
     def headers(self):
-        return getattr(self._file, "headers", None)
-
-    @property
-    def bucket(self):
-        return getattr(self._file, "bucket", None)
-
-    @property
-    def key(self):
-        return getattr(self._file, "key", None)
-
-    @property
-    def result(self):
-        return getattr(self._file, "result", None)
+        return self._native.headers() if self._reading else None
 
     @property
     def closed(self) -> bool:
-        return bool(getattr(self._file, "closed", False))
-
-    def __getattr__(self, name: str):
-        return getattr(self._file, name)
+        return bool(self._native.closed())
 
     def readable(self) -> bool:
-        readable = getattr(self._file, "readable", None)
-        return bool(readable()) if readable is not None else False
+        return self._reading and not self.closed
 
     def writable(self) -> bool:
-        writable = getattr(self._file, "writable", None)
-        return bool(writable()) if writable is not None else False
+        return not self._reading and not self.closed
 
     async def read(self, size: int = -1):
-        return await self._call("read", size)
+        if not self._reading:
+            raise io.UnsupportedOperation("not readable")
+        async with self._lock:
+            if self._binary:
+                return await self._native.read(size)
+            return await self._read_text(size)
 
     async def read1(self, size: int = -1):
-        if not hasattr(self._file, "read1"):
-            return await self.read(size)
-        return await self._call("read1", size)
+        return await self.read(size)
 
     async def readline(self, size: int = -1):
-        return await self._call("readline", size)
+        if not self._reading:
+            raise io.UnsupportedOperation("not readable")
+        async with self._lock:
+            if self._binary:
+                return await self._native.readline(size)
+            return await self._readline_text(size)
 
     async def readlines(self, hint: int = -1):
-        return await self._call("readlines", hint)
+        lines = []
+        total = 0
+        while True:
+            line = await self.readline()
+            if not line:
+                return lines
+            lines.append(line)
+            total += len(line)
+            if hint >= 0 and total >= hint:
+                return lines
 
     async def readinto(self, buffer) -> int:
-        return await self._call("readinto", buffer)
+        if not self._binary:
+            raise TypeError("readinto() is only supported in binary mode")
+        view = memoryview(buffer).cast("B")
+        data = await self.read(len(view))
+        view[: len(data)] = data
+        return len(data)
 
     def __aiter__(self):
         return self
@@ -662,37 +697,95 @@ class _AsyncS3File:
         return line
 
     async def write(self, data) -> int:
-        return await self._call("write", data)
+        if self._reading:
+            raise io.UnsupportedOperation("not writable")
+        if self._binary:
+            if isinstance(data, str):
+                raise TypeError("a bytes-like object is required, not 'str'")
+            body = bytes(data)
+            async with self._lock:
+                return await self._native.write(body)
+        if not isinstance(data, str):
+            raise TypeError("write() argument must be str, not bytes")
+        text = data
+        if self.newline not in (None, ""):
+            text = text.replace("\n", self.newline)
+        body = text.encode(self.encoding, self.errors)
+        async with self._lock:
+            await self._native.write(body)
+        return len(data)
 
     async def flush(self) -> None:
-        await self._call("flush")
+        if self._reading:
+            return None
+        async with self._lock:
+            await self._native.flush()
 
     async def close(self) -> None:
-        await self._call("close")
+        async with self._lock:
+            result_json = await self._native.close()
+            if not self._reading and result_json:
+                self.result = _loads(result_json)
 
     async def discard(self) -> None:
-        discard = getattr(self._file, "discard", None)
-        if discard is None:
+        if self._reading:
             await self.close()
             return
         async with self._lock:
-            await asyncio.to_thread(discard)
+            await self._native.discard()
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
-        exit_func = getattr(self._file, "__exit__", None)
-        if exit_func is None:
+        if exc_type is None or self._reading:
             await self.close()
-            return
-        async with self._lock:
-            await asyncio.to_thread(exit_func, exc_type, exc_value, traceback)
+        else:
+            await self.discard()
 
-    async def _call(self, method_name: str, *args):
-        method = getattr(self._file, method_name)
-        async with self._lock:
-            return await asyncio.to_thread(method, *args)
+    async def _fill_text(self) -> None:
+        if self._text_eof:
+            return
+        body = await self._native.read(64 * 1024)
+        if body:
+            self._text_buffer += self._decoder.decode(body, final=False)
+        else:
+            self._text_buffer += self._decoder.decode(b"", final=True)
+            self._text_eof = True
+
+    async def _read_text(self, size: int):
+        if size == 0:
+            return ""
+        if size < 0:
+            while not self._text_eof:
+                await self._fill_text()
+            result, self._text_buffer = self._text_buffer, ""
+            return result
+        while len(self._text_buffer) < size and not self._text_eof:
+            await self._fill_text()
+        result = self._text_buffer[:size]
+        self._text_buffer = self._text_buffer[size:]
+        return result
+
+    async def _readline_text(self, size: int):
+        if size == 0:
+            return ""
+        while True:
+            limit = len(self._text_buffer) if size < 0 else min(size, len(self._text_buffer))
+            newline_at = self._text_buffer.find("\n", 0, limit)
+            if newline_at >= 0:
+                end = newline_at + 1
+                result = self._text_buffer[:end]
+                self._text_buffer = self._text_buffer[end:]
+                return result
+            if size >= 0 and len(self._text_buffer) >= size:
+                result = self._text_buffer[:size]
+                self._text_buffer = self._text_buffer[size:]
+                return result
+            if self._text_eof:
+                result, self._text_buffer = self._text_buffer, ""
+                return result
+            await self._fill_text()
 
 
 class _S3BytesWriter(io.BytesIO):

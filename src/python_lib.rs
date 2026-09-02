@@ -2,7 +2,7 @@ use chrono::{SecondsFormat, Utc};
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyModule};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
+
+mod python_async;
+use python_async::{RustHttpClientAsync, RustObjectReaderAsync, RustObjectWriterAsync};
 
 const ERR_PREFIX: &str = "ALOCALS3_STORAGE_ERROR:";
 const SQLITE_POOL_SIZE: usize = 16;
@@ -213,7 +216,7 @@ impl RustHttpClient {
         bucket: &str,
         key: &str,
         range_header: Option<&str>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let mut request = self.stream_client.get(self.url(&object_path(bucket, key)));
         if let Some(range_header) = range_header {
             request = request.header(reqwest::header::RANGE, range_header);
@@ -225,8 +228,8 @@ impl RustHttpClient {
         }
         let headers = response.headers().clone();
         let body = response.bytes().map_err(http_error)?;
-        let result = PyDict::new_bound(py);
-        result.set_item("body", PyBytes::new_bound(py, &body))?;
+        let result = PyDict::new(py);
+        result.set_item("body", PyBytes::new(py, &body))?;
         result.set_item("headers", headers_to_dict(py, &headers)?)?;
         Ok(result.into())
     }
@@ -287,7 +290,7 @@ impl RustHttpClient {
         key: &str,
         output_path: &str,
         range_header: Option<&str>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let mut request = self.client.get(self.url(&object_path(bucket, key)));
         if let Some(range_header) = range_header {
             request = request.header(reqwest::header::RANGE, range_header);
@@ -312,7 +315,7 @@ impl RustHttpClient {
         bucket: &str,
         key: &str,
         range_header: &str,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let response = self
             .client
             .get(self.url(&object_path(bucket, key)))
@@ -325,8 +328,8 @@ impl RustHttpClient {
         }
         let headers = response.headers().clone();
         let body = response.bytes().map_err(http_error)?;
-        let result = PyDict::new_bound(py);
-        result.set_item("body", PyBytes::new_bound(py, &body))?;
+        let result = PyDict::new(py);
+        result.set_item("body", PyBytes::new(py, &body))?;
         result.set_item("headers", headers_to_dict(py, &headers)?)?;
         Ok(result.into())
     }
@@ -335,6 +338,7 @@ impl RustHttpClient {
         self.request_empty(self.client.delete(self.url(&object_path(bucket, key))))
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (source_bucket, source_key, destination_bucket, destination_key, metadata=None, metadata_directive=None, content_type=None))]
     fn copy_object_json(
         &self,
@@ -401,18 +405,18 @@ impl RustHttpClient {
 #[pymethods]
 impl RustObjectReader {
     #[pyo3(signature = (size=-1))]
-    fn read(&mut self, py: Python<'_>, size: isize) -> PyResult<PyObject> {
+    fn read(&mut self, py: Python<'_>, size: isize) -> PyResult<Py<PyAny>> {
         if self.closed {
             return Err(PyRuntimeError::new_err("I/O operation on closed S3 reader"));
         }
         if size == 0 {
-            return Ok(PyBytes::new_bound(py, &[]).into());
+            return Ok(PyBytes::new(py, &[]).into());
         }
         let Some(response) = self.response.as_mut() else {
-            return Ok(PyBytes::new_bound(py, &[]).into());
+            return Ok(PyBytes::new(py, &[]).into());
         };
         let body = py
-            .allow_threads(|| -> std::io::Result<Vec<u8>> {
+            .detach(|| -> std::io::Result<Vec<u8>> {
                 if size < 0 {
                     let mut out = Vec::new();
                     response.read_to_end(&mut out)?;
@@ -425,7 +429,7 @@ impl RustObjectReader {
                 }
             })
             .map_err(io_error)?;
-        Ok(PyBytes::new_bound(py, &body).into())
+        Ok(PyBytes::new(py, &body).into())
     }
 
     fn close(&mut self) {
@@ -458,7 +462,7 @@ impl RustObjectReader {
             Ok(0)
         } else {
             let dst = unsafe { std::slice::from_raw_parts_mut(view.buf.cast::<u8>(), view.len as usize) };
-            py.allow_threads(|| response.read(dst)).map_err(io_error)
+            py.detach(|| response.read(dst)).map_err(io_error)
         };
         unsafe {
             pyo3::ffi::PyBuffer_Release(&mut view);
@@ -466,7 +470,7 @@ impl RustObjectReader {
         result
     }
 
-    fn headers(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn headers(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         headers_to_dict(py, &self.headers)
     }
 
@@ -488,7 +492,7 @@ impl RustObjectWriter {
         let Some(file) = self.file.as_mut() else {
             return Err(PyRuntimeError::new_err("S3 writer has no open spool file"));
         };
-        py.allow_threads(|| file.write_all(body)).map_err(io_error)?;
+        py.detach(|| file.write_all(body)).map_err(io_error)?;
         Ok(body.len())
     }
 
@@ -497,7 +501,7 @@ impl RustObjectWriter {
             return Err(PyRuntimeError::new_err("I/O operation on closed S3 writer"));
         }
         if let Some(file) = self.file.as_mut() {
-            py.allow_threads(|| file.flush()).map_err(io_error)?;
+            py.detach(|| file.flush()).map_err(io_error)?;
         }
         Ok(())
     }
@@ -507,14 +511,14 @@ impl RustObjectWriter {
             return Ok(self.result_json.clone().unwrap_or_default());
         }
         if let Some(mut file) = self.file.take() {
-            py.allow_threads(|| file.flush()).map_err(io_error)?;
+            py.detach(|| file.flush()).map_err(io_error)?;
         }
         let temp_path = self.temp_path.clone();
         let client = self.client.clone();
         let url = self.url.clone();
         let content_type = self.content_type.clone();
         let result = py
-            .allow_threads(move || -> Result<String, PyErr> {
+            .detach(move || -> Result<String, PyErr> {
                 let len = fs::metadata(&temp_path).map_err(io_error)?.len();
                 let file = File::open(&temp_path).map_err(io_error)?;
                 let mut request = client
@@ -597,15 +601,15 @@ impl RustStorageBackend {
         })
     }
 
-    fn list_buckets(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn list_buckets(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let conn = self.conn()?;
         let mut stmt = conn
             .prepare("SELECT name, created_at FROM buckets ORDER BY name ASC")
             .map_err(db_error)?;
         let mut rows = stmt.query([]).map_err(db_error)?;
-        let out = PyList::empty_bound(py);
+        let out = PyList::empty(py);
         while let Some(row) = rows.next().map_err(db_error)? {
-            let item = PyDict::new_bound(py);
+            let item = PyDict::new(py);
             item.set_item("name", row.get::<_, String>(0).map_err(db_error)?)?;
             item.set_item("created_at", row.get::<_, String>(1).map_err(db_error)?)?;
             out.append(item)?;
@@ -613,7 +617,7 @@ impl RustStorageBackend {
         Ok(out.into())
     }
 
-    fn create_bucket(&self, py: Python<'_>, bucket: String) -> PyResult<PyObject> {
+    fn create_bucket(&self, py: Python<'_>, bucket: String) -> PyResult<Py<PyAny>> {
         validate_bucket(&bucket)?;
         let now = now_utc();
         let conn = self.conn()?;
@@ -657,7 +661,7 @@ impl RustStorageBackend {
         bucket: String,
         prefix: Option<String>,
         limit: i64,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         validate_bucket(&bucket)?;
         let prefix = prefix.unwrap_or_default();
         ensure_utf8(&prefix, "prefix")?;
@@ -670,7 +674,7 @@ impl RustStorageBackend {
             )
             .map_err(db_error)?;
         let mut rows = stmt.query(params![bucket_id]).map_err(db_error)?;
-        let out = PyList::empty_bound(py);
+        let out = PyList::empty(py);
         while let Some(row) = rows.next().map_err(db_error)? {
             let key: String = row.get(0).map_err(db_error)?;
             if !prefix.is_empty() && !key.starts_with(&prefix) {
@@ -694,7 +698,7 @@ impl RustStorageBackend {
         delimiter: Option<String>,
         max_keys: i64,
         continuation_token: Option<String>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         validate_bucket(&bucket)?;
         let prefix = prefix.unwrap_or_default();
         let delimiter = delimiter.unwrap_or_default();
@@ -717,8 +721,8 @@ impl RustStorageBackend {
             .map_err(db_error)?;
         let mut rows = stmt.query(params![bucket_id]).map_err(db_error)?;
 
-        let contents = PyList::empty_bound(py);
-        let common_prefixes = PyList::empty_bound(py);
+        let contents = PyList::empty(py);
+        let common_prefixes = PyList::empty(py);
         let mut common_prefix_set: Vec<String> = Vec::new();
         let mut key_count = 0_i64;
         let mut next_token: Option<String> = None;
@@ -763,7 +767,7 @@ impl RustStorageBackend {
             key_count += 1;
         }
 
-        let result = PyDict::new_bound(py);
+        let result = PyDict::new(py);
         result.set_item("bucket", bucket)?;
         result.set_item("prefix", prefix)?;
         result.set_item("delimiter", delimiter)?;
@@ -784,21 +788,21 @@ impl RustStorageBackend {
         key: String,
         body: &[u8],
         content_type: Option<String>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let body = body.to_vec();
         let (info_data, created) = py
-            .allow_threads(|| {
+            .detach(|| {
                 self.put_object_with_state_inner(&bucket, &key, &body, content_type.as_deref())
             })
             .map_err(storage_failure_to_py)?;
         let info = object_info_data_dict(py, &info_data)?;
-        let result = PyDict::new_bound(py);
+        let result = PyDict::new(py);
         result.set_item("info", info)?;
         result.set_item("created", created)?;
         Ok(result.into())
     }
 
-    fn get_object(&self, py: Python<'_>, bucket: String, key: String) -> PyResult<PyObject> {
+    fn get_object(&self, py: Python<'_>, bucket: String, key: String) -> PyResult<Py<PyAny>> {
         validate_bucket(&bucket)?;
         let key = normalize_key(&key)?;
         let conn = self.conn()?;
@@ -815,8 +819,8 @@ impl RustStorageBackend {
             &row.etag,
             &row.updated_at,
         )?;
-        let dict = info.downcast_bound::<PyDict>(py)?;
-        dict.set_item("body", PyBytes::new_bound(py, &body))?;
+        let dict = info.cast_bound::<PyDict>(py)?;
+        dict.set_item("body", PyBytes::new(py, &body))?;
         Ok(info)
     }
 
@@ -825,7 +829,7 @@ impl RustStorageBackend {
         py: Python<'_>,
         bucket: String,
         key: String,
-    ) -> PyResult<Option<PyObject>> {
+    ) -> PyResult<Option<Py<PyAny>>> {
         validate_bucket(&bucket)?;
         let key = normalize_key(&key)?;
         let conn = self.conn()?;
@@ -897,6 +901,9 @@ fn _alocals3_native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RustHttpClient>()?;
     m.add_class::<RustObjectReader>()?;
     m.add_class::<RustObjectWriter>()?;
+    m.add_class::<RustHttpClientAsync>()?;
+    m.add_class::<RustObjectReaderAsync>()?;
+    m.add_class::<RustObjectWriterAsync>()?;
     Ok(())
 }
 
@@ -1067,7 +1074,7 @@ fn object_record(conn: &Connection, bucket_id: i64, key: &str) -> PyResult<Objec
     .ok_or_else(|| storage_error(404, "Object not found"))
 }
 
-fn bucket_info(py: Python<'_>, conn: &Connection, bucket: &str) -> PyResult<PyObject> {
+fn bucket_info(py: Python<'_>, conn: &Connection, bucket: &str) -> PyResult<Py<PyAny>> {
     let created_at: String = conn
         .query_row(
             "SELECT created_at FROM buckets WHERE name = ?1",
@@ -1075,7 +1082,7 @@ fn bucket_info(py: Python<'_>, conn: &Connection, bucket: &str) -> PyResult<PyOb
             |row| row.get(0),
         )
         .map_err(db_error)?;
-    let dict = PyDict::new_bound(py);
+    let dict = PyDict::new(py);
     dict.set_item("name", bucket)?;
     dict.set_item("created_at", created_at)?;
     Ok(dict.into())
@@ -1094,7 +1101,7 @@ fn object_info_data(conn: &Connection, bucket: &str, key: &str) -> StorageResult
     })
 }
 
-fn object_info_data_dict(py: Python<'_>, data: &ObjectInfoData) -> PyResult<PyObject> {
+fn object_info_data_dict(py: Python<'_>, data: &ObjectInfoData) -> PyResult<Py<PyAny>> {
     object_info_dict(
         py,
         &data.bucket,
@@ -1111,7 +1118,7 @@ fn object_info_from_row(
     bucket: &str,
     key: &str,
     row: &rusqlite::Row<'_>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     object_info_dict(
         py,
         bucket,
@@ -1131,8 +1138,8 @@ fn object_info_dict(
     content_type: &str,
     etag: &str,
     updated_at: &str,
-) -> PyResult<PyObject> {
-    let dict = PyDict::new_bound(py);
+) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
     dict.set_item("bucket", bucket)?;
     dict.set_item("key", key)?;
     dict.set_item("size", size)?;
@@ -1324,8 +1331,8 @@ fn http_status_error(status: u16) -> PyErr {
     PyRuntimeError::new_err(format!("ALOCALS3_HTTP_STATUS:{status}"))
 }
 
-fn headers_to_dict(py: Python<'_>, headers: &reqwest::header::HeaderMap) -> PyResult<PyObject> {
-    let dict = PyDict::new_bound(py);
+fn headers_to_dict(py: Python<'_>, headers: &reqwest::header::HeaderMap) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
     for (name, value) in headers.iter() {
         if let Ok(value) = value.to_str() {
             dict.set_item(name.as_str().to_ascii_lowercase(), value)?;

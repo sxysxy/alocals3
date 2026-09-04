@@ -1112,12 +1112,23 @@ fn apply_public_object_headers(
     if immutable {
         response.headers_mut().insert(
             header::CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=31536000, immutable"),
+            // `/api/object` is authenticated by a user cookie. `private`
+            // still enables the browser's disk/memory cache while preventing
+            // a future shared proxy cache from serving one user's response to
+            // another user.
+            HeaderValue::from_static("private, max-age=31536000, immutable"),
         );
     } else if one_day {
         response.headers_mut().insert(
             header::CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=86400"),
+            HeaderValue::from_static("private, max-age=86400"),
+        );
+    } else {
+        // Mutable objects may stay in the browser cache, but every reuse must
+        // validate the ETag so an overwritten key cannot return stale data.
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-cache"),
         );
     }
     if terrain_gzip {
@@ -2829,6 +2840,52 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["root"]["content"]["uri"], "tile.b3dm");
         assert!(payload["root"]["content"].get("url").is_none());
+    }
+
+    #[test]
+    fn authenticated_public_objects_use_browser_only_cache_policies() {
+        let mut model_response = Response::new(Body::empty());
+        apply_public_object_headers(
+            &mut model_response,
+            "models",
+            "system/structure/models/model.glb",
+            false,
+        );
+        assert_eq!(
+            model_response.headers()[header::CACHE_CONTROL],
+            "private, max-age=31536000, immutable"
+        );
+
+        let mut map_manifest_response = Response::new(Body::empty());
+        apply_public_object_headers(
+            &mut map_manifest_response,
+            "lauraycs-maps",
+            "system/gis/city/3dtiles/tileset.json",
+            false,
+        );
+        assert_eq!(
+            map_manifest_response.headers()[header::CACHE_CONTROL],
+            "private, max-age=31536000, immutable"
+        );
+
+        let mut preview_response = Response::new(Body::empty());
+        apply_public_object_headers(&mut preview_response, "assets", "previews/model.png", false);
+        assert_eq!(
+            preview_response.headers()[header::CACHE_CONTROL],
+            "private, max-age=86400"
+        );
+
+        let mut mutable_response = Response::new(Body::empty());
+        apply_public_object_headers(
+            &mut mutable_response,
+            "assets",
+            "projects/project-1/draft.json",
+            false,
+        );
+        assert_eq!(
+            mutable_response.headers()[header::CACHE_CONTROL],
+            "private, no-cache"
+        );
     }
 
     async fn test_storage() -> (Storage, PathBuf) {

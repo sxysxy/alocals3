@@ -278,6 +278,12 @@ Supported object features:
 - `If-None-Match` and `If-Match` are supported for `PUT`.
 - `Content-MD5` is validated on `PUT`.
 - `If-None-Match` is supported for `GET` and `HEAD`.
+- `/api/object` returns `Cache-Control: private, max-age=31536000, immutable`
+  for immutable maps, GLB/glTF models, 3D Tiles, and terrain tiles so browsers
+  can reuse downloaded content. Regular images are cached for one day. Other
+  potentially mutable objects use `private, no-cache` with ETag revalidation
+  and return `304` when unchanged. `private` prevents shared-proxy caching but
+  does not disable the browser cache.
 
 The browser-facing endpoint normally uses the same streaming path. Only
 `*/3dtiles/tileset.json` and `*/terrain/layer.json` are buffered because their

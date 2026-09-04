@@ -267,6 +267,10 @@ Bucket 名称、对象 key、prefix、delimiter、continuation token 都按 UTF-
 - `PUT` 支持 `If-None-Match` 和 `If-Match`。
 - `PUT` 支持 `Content-MD5` 校验。
 - `GET` 和 `HEAD` 支持 `If-None-Match`。
+- `/api/object` 对地图、GLB/glTF、3D Tiles、地形瓦片等不可变资源返回
+  `Cache-Control: private, max-age=31536000, immutable`，允许浏览器长期复用已下载内容；
+  常规图片缓存一天。其他可能被覆盖的对象使用 `private, no-cache` 配合 ETag
+  条件请求，内容未变化时返回 `304`。`private` 只禁止共享代理缓存，不会禁用浏览器缓存。
 
 面向浏览器的接口通常复用同一流式路径。只有 `*/3dtiles/tileset.json` 和
 `*/terrain/layer.json` 因为需要改写旧版兼容字段而进行内存缓冲，且缓冲上限为

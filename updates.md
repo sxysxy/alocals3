@@ -1,4 +1,4 @@
-# Version 0.9.2
+# Version 0.9.3
 
 - Add a native Tokio/PyO3 async Python client without `asyncio.to_thread`
 - Stream PUT request bodies directly to temporary files with incremental MD5 and SHA-256 hashing

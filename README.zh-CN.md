@@ -267,10 +267,19 @@ Bucket 名称、对象 key、prefix、delimiter、continuation token 都按 UTF-
 - `PUT` 支持 `If-None-Match` 和 `If-Match`。
 - `PUT` 支持 `Content-MD5` 校验。
 - `GET` 和 `HEAD` 支持 `If-None-Match`。
-- `/api/object` 对地图、GLB/glTF、3D Tiles、地形瓦片等不可变资源返回
-  `Cache-Control: private, max-age=31536000, immutable`，允许浏览器长期复用已下载内容；
-  常规图片缓存一天。其他可能被覆盖的对象使用 `private, no-cache` 配合 ETag
-  条件请求，内容未变化时返回 `304`。`private` 只禁止共享代理缓存，不会禁用浏览器缓存。
+- 对象响应使用 `private, no-cache` 配合 ETag 条件请求，内容未变化时返回 `304`；
+  这样既允许浏览器私有缓存，也不会把可覆盖的 bucket/key 路径误认为永久不变。
+- `/api/object` 会用 `private, no-store` 把无版本路径重定向到
+  `/api/object/{bucket}/{key}?version={etag}`。版本与当前对象一致时返回
+  `private, max-age=31536000, immutable`；版本缺失或过期时重定向到当前版本。
+  查询参数属于浏览器缓存键，因此覆盖同路径对象会生成新缓存项，不会复用旧内容。
+  `private` 会阻止共享代理缓存已鉴权的对象，`Vary: Authorization, Cookie` 则按凭据
+  隔离浏览器私有缓存项。
+
+从曾把纯路径 URL 标记为 `immutable` 的版本升级时，客户端需要至少修改一次请求 URL
+（例如追加 `?cache-version=2`），或者清理旧浏览器缓存。服务端的新响应头无法撤销已经
+缓存的 immutable 响应；修改 URL 后请求会到达服务端，再被重定向到规范的
+`?version={etag}` URL。
 
 面向浏览器的接口通常复用同一流式路径。只有 `*/3dtiles/tileset.json` 和
 `*/terrain/layer.json` 因为需要改写旧版兼容字段而进行内存缓冲，且缓冲上限为

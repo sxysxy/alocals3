@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{OriginalUri, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
@@ -11,7 +11,7 @@ use clap::Parser;
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use percent_encoding::percent_decode_str;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -188,6 +188,11 @@ struct ObjectInfo {
     etag: String,
     updated_at: String,
     metadata: HashMap<String, String>,
+}
+
+#[derive(Default, Deserialize)]
+struct PublicObjectQuery {
+    version: Option<String>,
 }
 
 struct StoredObject {
@@ -912,9 +917,15 @@ async fn get_object(
 async fn get_public_object(
     State(state): State<AppState>,
     AxumPath((bucket, key)): AxumPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    Query(query): Query<PublicObjectQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let mut source = state.storage.get_object_source(&bucket, &key).await?;
+    let object_version = source.info.etag.clone();
+    if query.version.as_deref() != Some(object_version.as_str()) {
+        return Ok(public_object_version_redirect(&uri, &object_version));
+    }
     let lower_key = source.info.key.to_ascii_lowercase();
     source.info.content_type =
         public_content_type(&lower_key, &source.info.content_type).to_string();
@@ -940,7 +951,7 @@ async fn get_public_object(
     } else {
         stream_object_response(source, &headers).await?
     };
-    apply_public_object_headers(&mut response, &bucket, &key, terrain_gzip);
+    apply_public_object_headers(&mut response, terrain_gzip);
     Ok(response)
 }
 
@@ -972,6 +983,8 @@ async fn head_object(
 async fn head_public_object(
     State(state): State<AppState>,
     AxumPath((bucket, key)): AxumPath<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    Query(query): Query<PublicObjectQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let mut info = state
@@ -979,10 +992,13 @@ async fn head_public_object(
         .get_object_info(&bucket, &key)
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Object not found"))?;
+    if query.version.as_deref() != Some(info.etag.as_str()) {
+        return Ok(public_object_version_redirect(&uri, &info.etag));
+    }
     let lower_key = info.key.to_ascii_lowercase();
     info.content_type = public_content_type(&lower_key, &info.content_type).to_string();
     let mut response = object_head_response(info, &headers)?;
-    apply_public_object_headers(&mut response, &bucket, &key, false);
+    apply_public_object_headers(&mut response, false);
     Ok(response)
 }
 
@@ -1089,48 +1105,39 @@ fn sanitize_terrain_layer_json(body: &mut Vec<u8>) {
     }
 }
 
-fn apply_public_object_headers(
-    response: &mut Response,
-    bucket: &str,
-    key: &str,
-    terrain_gzip: bool,
-) {
-    let key = key.to_ascii_lowercase();
-    let bucket = bucket.to_ascii_lowercase();
-    let immutable = (bucket == "lauraycs-maps" && key.starts_with("system/gis/"))
-        || (key.contains("/simulation-results/")
-            && [".png", ".json", ".svg"]
-                .iter()
-                .any(|suffix| key.ends_with(suffix)))
-        || [".terrain", ".glb", ".gltf", ".b3dm", ".i3dm", ".cmpt"]
-            .iter()
-            .any(|suffix| key.ends_with(suffix));
-    let one_day = (bucket == "lauraycs-maps" && key.ends_with(".json"))
-        || [".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"]
-            .iter()
-            .any(|suffix| key.ends_with(suffix));
-    if immutable {
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            // `/api/object` is authenticated by a user cookie. `private`
-            // still enables the browser's disk/memory cache while preventing
-            // a future shared proxy cache from serving one user's response to
-            // another user.
-            HeaderValue::from_static("private, max-age=31536000, immutable"),
-        );
-    } else if one_day {
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, max-age=86400"),
-        );
-    } else {
-        // Mutable objects may stay in the browser cache, but every reuse must
-        // validate the ETag so an overwritten key cannot return stale data.
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, no-cache"),
-        );
-    }
+fn public_object_version_redirect(uri: &http::Uri, version: &str) -> Response {
+    let mut response = StatusCode::TEMPORARY_REDIRECT.into_response();
+    response.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_str(&format!("{}?version={version}", uri.path())).unwrap(),
+    );
+    // Never cache the path-only redirect: the object assigned to a bucket/key
+    // can change, in which case the canonical versioned URL changes with it.
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        header::VARY,
+        HeaderValue::from_static("Authorization, Cookie"),
+    );
+    response
+}
+
+fn apply_public_object_headers(response: &mut Response, terrain_gzip: bool) {
+    // The handler only calls this for a URL whose version query matches the
+    // current object's ETag. That makes the complete URL content-addressed and
+    // therefore safe to retain indefinitely in a private browser cache.
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=31536000, immutable"),
+    );
+    // Private browser caches do not automatically include credentials in the
+    // cache key. Keep cached authenticated responses separated by credential.
+    response.headers_mut().insert(
+        header::VARY,
+        HeaderValue::from_static("Authorization, Cookie"),
+    );
     if terrain_gzip {
         response
             .headers_mut()
@@ -2183,6 +2190,10 @@ async fn stream_object_response(
 ) -> ApiResult<Response> {
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    response_headers.insert(
         header::ETAG,
         HeaderValue::from_str(&format!("\"{}\"", source.info.etag)).unwrap(),
     );
@@ -2250,6 +2261,10 @@ fn object_response(
 ) -> ApiResult<Response> {
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    response_headers.insert(
         header::ETAG,
         HeaderValue::from_str(&format!("\"{}\"", obj.info.etag)).unwrap(),
     );
@@ -2309,6 +2324,10 @@ fn object_response(
 
 fn object_head_response(info: ObjectInfo, headers: &HeaderMap) -> ApiResult<Response> {
     let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
     response_headers.insert(
         header::ETAG,
         HeaderValue::from_str(&format!("\"{}\"", info.etag)).unwrap(),
@@ -2843,49 +2862,36 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_public_objects_use_browser_only_cache_policies() {
-        let mut model_response = Response::new(Body::empty());
-        apply_public_object_headers(
-            &mut model_response,
-            "models",
-            "system/structure/models/model.glb",
-            false,
+    fn public_objects_only_make_versioned_urls_immutable() {
+        let uri = "/api/object/models/system/structure/models/model.glb"
+            .parse::<http::Uri>()
+            .unwrap();
+        let redirect = public_object_version_redirect(&uri, "abc123");
+        assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            redirect.headers()[header::LOCATION],
+            "/api/object/models/system/structure/models/model.glb?version=abc123"
         );
         assert_eq!(
-            model_response.headers()[header::CACHE_CONTROL],
+            redirect.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_eq!(redirect.headers()[header::VARY], "Authorization, Cookie");
+
+        let mut versioned_response = Response::new(Body::empty());
+        apply_public_object_headers(&mut versioned_response, false);
+        assert_eq!(
+            versioned_response.headers()[header::CACHE_CONTROL],
             "private, max-age=31536000, immutable"
         );
-
-        let mut map_manifest_response = Response::new(Body::empty());
-        apply_public_object_headers(
-            &mut map_manifest_response,
-            "lauraycs-maps",
-            "system/gis/city/3dtiles/tileset.json",
-            false,
-        );
         assert_eq!(
-            map_manifest_response.headers()[header::CACHE_CONTROL],
-            "private, max-age=31536000, immutable"
+            versioned_response.headers()[header::VARY],
+            "Authorization, Cookie"
         );
 
-        let mut preview_response = Response::new(Body::empty());
-        apply_public_object_headers(&mut preview_response, "assets", "previews/model.png", false);
-        assert_eq!(
-            preview_response.headers()[header::CACHE_CONTROL],
-            "private, max-age=86400"
-        );
-
-        let mut mutable_response = Response::new(Body::empty());
-        apply_public_object_headers(
-            &mut mutable_response,
-            "assets",
-            "projects/project-1/draft.json",
-            false,
-        );
-        assert_eq!(
-            mutable_response.headers()[header::CACHE_CONTROL],
-            "private, no-cache"
-        );
+        let mut terrain_response = Response::new(Body::empty());
+        apply_public_object_headers(&mut terrain_response, true);
+        assert_eq!(terrain_response.headers()[header::CONTENT_ENCODING], "gzip");
     }
 
     async fn test_storage() -> (Storage, PathBuf) {
@@ -2995,6 +3001,10 @@ mod tests {
         let response = object_head_response(info, &HeaderMap::new()).unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-cache"
+        );
         assert_eq!(response.headers()[header::CONTENT_LENGTH], "7");
         assert_eq!(
             response.headers()[header::CONTENT_TYPE],
@@ -3033,6 +3043,10 @@ mod tests {
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-cache"
+        );
+        assert_eq!(
             response.headers()[header::CONTENT_LENGTH],
             payload.len().to_string()
         );
@@ -3066,6 +3080,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body.as_ref(), &payload[10..20]);
+
+        let mut conditional_headers = HeaderMap::new();
+        conditional_headers.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(&format!("\"{}\"", info.etag)).unwrap(),
+        );
+        let response = stream_object_response(
+            storage
+                .get_object_source("test-bucket", "stream.bin")
+                .await
+                .unwrap(),
+            &conditional_headers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-cache"
+        );
 
         tokio::fs::remove_dir_all(root).await.unwrap();
     }

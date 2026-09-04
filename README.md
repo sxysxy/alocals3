@@ -278,12 +278,23 @@ Supported object features:
 - `If-None-Match` and `If-Match` are supported for `PUT`.
 - `Content-MD5` is validated on `PUT`.
 - `If-None-Match` is supported for `GET` and `HEAD`.
-- `/api/object` returns `Cache-Control: private, max-age=31536000, immutable`
-  for immutable maps, GLB/glTF models, 3D Tiles, and terrain tiles so browsers
-  can reuse downloaded content. Regular images are cached for one day. Other
-  potentially mutable objects use `private, no-cache` with ETag revalidation
-  and return `304` when unchanged. `private` prevents shared-proxy caching but
-  does not disable the browser cache.
+- Object responses use `private, no-cache` with ETag revalidation and return
+  `304` when unchanged. This permits private browser caching without treating a
+  mutable bucket/key path as a permanent object identity.
+- `/api/object` redirects an unversioned path to
+  `/api/object/{bucket}/{key}?version={etag}` with `private, no-store`. A request
+  whose version matches the current object receives
+  `private, max-age=31536000, immutable`; a missing or stale version redirects
+  to the current version. The query string is part of the browser cache key, so
+  overwriting an object produces a new cache entry instead of reusing stale
+  bytes. `private` prevents shared-proxy caching of authenticated objects, and
+  `Vary: Authorization, Cookie` separates private cache entries by credential.
+
+Clients upgrading from a release that cached the path-only URL as `immutable`
+should change the requested URL once (for example, append `?cache-version=2`)
+or clear the old browser cache. An already-cached immutable response cannot be
+revoked by new server headers; the changed URL reaches the server and is then
+redirected to the canonical `?version={etag}` URL.
 
 The browser-facing endpoint normally uses the same streaming path. Only
 `*/3dtiles/tileset.json` and `*/terrain/layer.json` are buffered because their

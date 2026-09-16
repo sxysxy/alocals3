@@ -101,6 +101,38 @@ impl RustHttpClient {
         })
     }
 
+    #[pyo3(signature = (bucket, key, content_type=None, metadata=None))]
+    fn create_multipart_upload_json(&self, bucket: &str, key: &str,
+        content_type: Option<&str>, metadata: Option<HashMap<String, String>>) -> PyResult<String> {
+        let url = self.url(&format!("/s3-multipart/{}/{}", encode_segment(bucket), encode_key(key)));
+        let mut request = self.client.post(url);
+        if let Some(value) = content_type { request = request.header("content-type", value); }
+        if let Some(metadata) = metadata {
+            for (key, value) in metadata { request = request.header(format!("x-amz-meta-{key}"), value); }
+        }
+        self.request_json(request)
+    }
+
+    fn upload_part_json(&self, upload_id: &str, part_number: u64, body: &[u8]) -> PyResult<String> {
+        let url = self.url(&format!("/s3-uploads/{}/{}", encode_segment(upload_id), part_number));
+        self.request_json(self.stream_client.put(url).body(body.to_vec()))
+    }
+
+    fn list_parts_json(&self, upload_id: &str) -> PyResult<String> {
+        let url = self.url(&format!("/s3-uploads/{}", encode_segment(upload_id)));
+        self.request_json(self.client.get(url))
+    }
+
+    fn complete_multipart_upload_json(&self, upload_id: &str, manifest: &str) -> PyResult<String> {
+        let url = self.url(&format!("/s3-uploads/{}", encode_segment(upload_id)));
+        self.request_json(self.stream_client.post(url).header("content-type", "application/json").body(manifest.to_string()))
+    }
+
+    fn abort_multipart_upload(&self, upload_id: &str) -> PyResult<()> {
+        let url = self.url(&format!("/s3-uploads/{}", encode_segment(upload_id)));
+        self.request_empty(self.client.delete(url))
+    }
+
     fn health_json(&self) -> PyResult<String> {
         self.request_json(self.client.get(self.url("/healthz")))
     }

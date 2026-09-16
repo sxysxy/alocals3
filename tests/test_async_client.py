@@ -48,6 +48,10 @@ class AsyncClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(downloaded, body)
         self.assertEqual(headers["x-amz-meta-origin"], "native-async")
 
+        head_headers = await self.client.head_object(self.bucket, "folder/source.bin")
+        for name in ("content-length", "etag", "content-type", "x-amz-meta-origin"):
+            self.assertEqual(head_headers[name], headers[name])
+
         ranged, range_headers = await self.client.get_object_range(
             self.bucket, "folder/source.bin", "bytes=7-31"
         )

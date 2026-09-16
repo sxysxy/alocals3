@@ -426,3 +426,61 @@ curl -i -X PUT -H "Content-MD5: ${MD5_B64}" --data-binary @file.bin \
 ## License
 
 [The MIT License](LICENSE)
+
+### 异步对象元数据（HEAD）
+
+```python
+headers = await client.head_object("my-bucket", "folder/object.arrow")
+size = int(headers["content-length"])
+etag = headers["etag"]
+```
+
+`ALocalS3ClientAsync.head_object` 返回小写键名的 HTTP 响应头，包括文件大小、
+ETag、最后修改时间、内容类型和 `x-amz-meta-*` 自定义元数据。
+该接口复用原生异步连接池、认证、代理和超时设置，不下载正文、不列举 bucket。
+空文件的 `content-length` 为 `0`；包括 404 在内的 HTTP 错误沿用
+`RuntimeError` 和 `ALOCALS3_HTTP_STATUS:<状态码>` 标记。
+
+### 分批上传单个对象（Multipart Upload）
+
+同步 `ALocalS3Client` 与原生异步 `ALocalS3ClientAsync` 都提供以下接口；
+同步调用去掉示例中的 `await` 即可。客户端和服务端都需要包含此补丁的构建。
+
+```python
+upload = await client.create_multipart_upload(
+    "my-bucket", "results/data.arrow", "application/vnd.apache.arrow.file"
+)
+upload_id = upload["upload_id"]  # 持久化此 ID，进程重启后可继续上传
+first = await client.upload_part(upload_id, 1, b"first batch")
+second = await client.upload_part(upload_id, 2, b"second batch")
+# 同一个编号重传会替换该分片；不同编号可以并发上传。
+parts = (await client.list_parts(upload_id))["parts"]
+result = await client.complete_multipart_upload(upload_id, parts)
+# 确认提交结果已持久化后，可释放提交回执；不会删除已发布的对象。
+await client.abort_multipart_upload(upload_id)
+```
+
+- `pending_uploads` 保存上传会话，`pending_upload_parts` 保存逐片记录；
+  分片文件保存在存储根目录的 `multipart/`，不进入已发布对象的 GC 范围。
+  主对象表 **不增加上传状态字段**，上传中的内容不可通过 GET/HEAD/List 读取。
+- 完成时按编号流式合并，校验每片长度及 MD5。提交清单必须包含全部已上传分片、
+  编号从 1 连续递增且 ETag 匹配，缺片、重复、乱序或旧清单均报错，绝不静默丢片。
+- 文件安装成功后，在同一个短事务内写入主对象表、移除 pending 数据，并保存
+  `completed_uploads` 回执。覆盖旧对象时，提交前仍可读取旧对象；事务失败可重试。
+  重复提交同一清单返回原回执，不会覆盖之后写入的新版本。空清单可创建空对象。
+- 上传接收和文件合并不持有 SQL 连接；SQLite 和 PostgreSQL 均支持。
+  使用非阻塞 OS 文件锁协调同一存储目录上的多个服务进程，服务重启后可以续传。
+  构建工具链要求 Rust 1.89 或更新版本。
+- 不设最小分片大小、16 MiB 分片上限或业务分片数量上限。
+  服务端已有的 `max_upload_size` 若明确设为非零，则同时检查总大小；默认 0 表示不限。
+  服务端合并采用固定缓冲区，客户端 `upload_part` 只需要提供当前分片的字节数据。
+- `abort_multipart_upload` 可取消未完成上传并删除分片，也可释放完成回执。
+  未完成会话不会自动过期，以免误删仍需续传的数据；调用方应保存 ID 并在放弃时取消。
+- 这是 alocals3 的 JSON 分片协议，不是 AWS S3 的 XML multipart 协议：
+  `POST /s3-multipart/<bucket>/<key>` 创建；`PUT /s3-uploads/<id>/<part_number>` 上传；
+  `GET /s3-uploads/<id>` 查询；`POST /s3-uploads/<id>` 提交；`DELETE /s3-uploads/<id>` 取消。
+  所有路由复用服务凭据认证；数据库新表由服务启动时自动创建。
+
+测试：先构建服务端并安装新客户端，再运行 `python tests/test_multipart.py`。
+默认使用隔离的 SQLite 临时数据库；设置 `ALOCALS3_TEST_POSTGRES_URL` 后使用指定
+PostgreSQL 数据库中的临时 schema，测试完成后删除，不使用业务表。

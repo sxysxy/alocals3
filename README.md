@@ -452,3 +452,63 @@ curl -i -X PUT -H "Content-MD5: ${MD5_B64}" --data-binary @file.bin \
 ## License
 
 [The MIT License](LICENSE)
+
+### Async object metadata (HEAD)
+
+```python
+headers = await client.head_object("my-bucket", "folder/object.arrow")
+size = int(headers["content-length"])
+etag = headers["etag"]
+```
+
+`ALocalS3ClientAsync.head_object` returns lowercase HTTP response headers,
+including object size, ETag, last-modified, content-type and custom
+`x-amz-meta-*` fields. It uses the native async connection pool, authentication,
+proxy and timeout settings, without downloading the body or listing the bucket.
+Empty objects return `content-length: 0`. HTTP failures raise `RuntimeError`
+with the existing `ALOCALS3_HTTP_STATUS:<code>` marker, including 404.
+
+### Multipart uploads
+
+Both `ALocalS3Client` and the native `ALocalS3ClientAsync` support
+`create_multipart_upload`, `upload_part`, `list_parts`,
+`complete_multipart_upload`, and `abort_multipart_upload`.
+
+```python
+upload = await client.create_multipart_upload("bucket", "result.arrow")
+upload_id = upload["upload_id"]  # persist this to resume after restart
+first = await client.upload_part(upload_id, 1, b"first batch")
+second = await client.upload_part(upload_id, 2, b"second batch")
+result = await client.complete_multipart_upload(upload_id, [first, second])
+await client.abort_multipart_upload(upload_id)  # release receipt; object stays
+```
+
+Unpublished sessions/parts use separate `pending_uploads` and
+`pending_upload_parts` tables. No upload-state columns are added to `objects`.
+Completion validates every part, assembles with bounded memory, then atomically
+publishes the object, deletes pending records, and writes a retry receipt in
+`completed_uploads`. Failed transactions preserve the old object and pending
+parts. Identical completion retries return the original receipt without
+replacing newer object versions. Database connections are not held during
+upload reception or file assembly.
+
+Part numbers must be consecutive from 1 and the completion manifest must match
+all stored parts and their ETags. Re-uploading a number replaces that part;
+different parts may upload concurrently. Sessions survive server restarts.
+There is no minimum part size, 16 MiB limit, or policy limit on part count;
+an explicitly configured server `max_upload_size` also applies to aggregate
+size (default 0: unlimited). Pending sessions are retained until explicitly
+aborted; persist upload IDs and abort abandoned uploads. An empty manifest can
+publish an empty object. Both SQLite and PostgreSQL are supported; new tables
+are created on server startup. Filesystem locks coordinate servers sharing
+the same storage directory; building requires Rust 1.89+.
+
+This is an alocals3 JSON protocol, not the AWS XML multipart API:
+`POST /s3-multipart/<bucket>/<key>`, `PUT /s3-uploads/<id>/<part_number>`,
+and GET/POST/DELETE on `/s3-uploads/<id>` for list/complete/abort respectively.
+All endpoints require the usual service credentials. Update **both** server
+and client builds before using this API.
+
+Run `python tests/test_multipart.py` after building/installing. Tests create
+an isolated SQLite database by default. Set `ALOCALS3_TEST_POSTGRES_URL` to use
+an isolated temporary PostgreSQL schema instead (requires psycopg for tests).

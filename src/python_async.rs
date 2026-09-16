@@ -118,6 +118,46 @@ impl RustHttpClientAsync {
         })
     }
 
+    fn head_object<'py>(
+        &self,
+        py: Python<'py>,
+        bucket: &str,
+        key: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = self.inner.client.head(self.inner.url(&object_path(bucket, key)));
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let response = checked_response(request).await?;
+            Ok(headers_to_map(response.headers()))
+        })
+    }
+
+    #[pyo3(signature = (bucket, key, content_type=None, metadata=None))]
+    fn create_multipart_upload_json<'py>(&self, py: Python<'py>, bucket: &str, key: &str,
+        content_type: Option<&str>, metadata: Option<HashMap<String, String>>) -> PyResult<Bound<'py, PyAny>> {
+        let url = self.inner.url(&format!("/s3-multipart/{}/{}", encode_segment(bucket), encode_key(key)));
+        self.request_json(py, add_request_headers(self.inner.client.post(url), content_type, metadata))
+    }
+
+    fn upload_part_json<'py>(&self, py: Python<'py>, upload_id: &str, part_number: u64, body: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+        let url = self.inner.url(&format!("/s3-uploads/{}/{}", encode_segment(upload_id), part_number));
+        self.request_json(py, self.inner.stream_client.put(url).body(body.to_vec()))
+    }
+
+    fn list_parts_json<'py>(&self, py: Python<'py>, upload_id: &str) -> PyResult<Bound<'py, PyAny>> {
+        let url = self.inner.url(&format!("/s3-uploads/{}", encode_segment(upload_id)));
+        self.request_json(py, self.inner.client.get(url))
+    }
+
+    fn complete_multipart_upload_json<'py>(&self, py: Python<'py>, upload_id: &str, manifest: &str) -> PyResult<Bound<'py, PyAny>> {
+        let url = self.inner.url(&format!("/s3-uploads/{}", encode_segment(upload_id)));
+        self.request_json(py, self.inner.stream_client.post(url).header(CONTENT_TYPE, "application/json").body(manifest.to_string()))
+    }
+
+    fn abort_multipart_upload<'py>(&self, py: Python<'py>, upload_id: &str) -> PyResult<Bound<'py, PyAny>> {
+        let url = self.inner.url(&format!("/s3-uploads/{}", encode_segment(upload_id)));
+        self.request_empty(py, self.inner.client.delete(url))
+    }
+
     fn health_json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.request_json(py, self.inner.client.get(self.inner.url("/healthz")))
     }

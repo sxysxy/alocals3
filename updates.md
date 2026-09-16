@@ -1,3 +1,12 @@
+# Version 0.9.4
+
+- Add native async `head_object` for metadata queries without downloading objects or listing buckets
+- Add multipart upload APIs to synchronous and native async clients, with resumable sessions and per-part retries
+- Store pending uploads and parts in separate tables; publish complete objects and remove pending records atomically
+- Validate complete manifests and part checksums, preserve completion receipts for safe retries, and support abort cleanup
+- Support SQLite and PostgreSQL, cross-process upload coordination, and bounded-memory file assembly
+- Require Rust 1.89 or newer for nonblocking filesystem locks
+
 # Version 0.9.3
 
 - Cache-Contorl with version

@@ -1,3 +1,5 @@
+mod multipart;
+
 use axum::body::Body;
 use axum::extract::{OriginalUri, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
@@ -650,6 +652,9 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/s3", get(list_buckets))
+        .route("/s3-multipart/:bucket/*key", axum::routing::post(multipart::create))
+        .route("/s3-uploads/:upload_id", get(multipart::list).delete(multipart::abort).post(multipart::complete).layer(axum::extract::DefaultBodyLimit::disable()))
+        .route("/s3-uploads/:upload_id/:part_number", put(multipart::upload_part))
         .route(
             "/s3/:bucket",
             put(create_bucket)
@@ -701,7 +706,9 @@ async fn delete_bucket(
     State(state): State<AppState>,
     AxumPath(bucket): AxumPath<String>,
 ) -> ApiResult<StatusCode> {
+    let uploads = multipart::bucket_sessions(&state.storage, &bucket).await?;
     state.storage.delete_bucket(&bucket).await?;
+    multipart::clean_bucket_sessions(&state.storage, &uploads).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2139,6 +2146,18 @@ async fn init_sqlite(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_file_path ON objects (file_path)")
         .execute(pool)
         .await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS pending_uploads (
+ upload_id TEXT PRIMARY KEY, bucket_id BIGINT NOT NULL REFERENCES buckets(id) ON DELETE CASCADE,
+ session TEXT NOT NULL)").execute(pool).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS pending_upload_parts (
+ upload_id TEXT NOT NULL REFERENCES pending_uploads(upload_id) ON DELETE CASCADE,
+ part_number BIGINT NOT NULL, etag TEXT NOT NULL, size BIGINT NOT NULL, file TEXT NOT NULL,
+ PRIMARY KEY(upload_id, part_number))").execute(pool).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS completed_uploads (
+ upload_id TEXT PRIMARY KEY, bucket_id BIGINT NOT NULL REFERENCES buckets(id) ON DELETE CASCADE,
+ session TEXT NOT NULL)").execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_pending_uploads_bucket ON pending_uploads(bucket_id)").execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_completed_uploads_bucket ON completed_uploads(bucket_id)").execute(pool).await?;
     Ok(())
 }
 
@@ -2181,6 +2200,18 @@ async fn init_pg(pool: &PgPool) -> anyhow::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_file_path ON objects (file_path)")
         .execute(pool)
         .await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS pending_uploads (
+ upload_id TEXT PRIMARY KEY, bucket_id BIGINT NOT NULL REFERENCES buckets(id) ON DELETE CASCADE,
+ session TEXT NOT NULL)").execute(pool).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS pending_upload_parts (
+ upload_id TEXT NOT NULL REFERENCES pending_uploads(upload_id) ON DELETE CASCADE,
+ part_number BIGINT NOT NULL, etag TEXT NOT NULL, size BIGINT NOT NULL, file TEXT NOT NULL,
+ PRIMARY KEY(upload_id, part_number))").execute(pool).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS completed_uploads (
+ upload_id TEXT PRIMARY KEY, bucket_id BIGINT NOT NULL REFERENCES buckets(id) ON DELETE CASCADE,
+ session TEXT NOT NULL)").execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_pending_uploads_bucket ON pending_uploads(bucket_id)").execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_completed_uploads_bucket ON completed_uploads(bucket_id)").execute(pool).await?;
     Ok(())
 }
 

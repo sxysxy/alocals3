@@ -30,6 +30,36 @@ class ALocalS3Client:
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         self.close()
 
+    def create_multipart_upload(
+        self, bucket: str, key: str, content_type: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> dict:
+        """Create an unpublished upload session; persist its upload_id to resume."""
+        return _loads(self._client.create_multipart_upload_json(bucket, key, content_type, metadata))
+
+    def upload_part(self, upload_id: str, part_number: int, body: bytes | bytearray | memoryview) -> dict:
+        """Upload/replace a numbered part. No part size or count policy is imposed."""
+        if isinstance(part_number, bool) or not isinstance(part_number, int) or part_number < 1:
+            raise ValueError("part_number must be a positive integer")
+        return _loads(self._client.upload_part_json(upload_id, part_number, bytes(body)))
+
+    def list_parts(self, upload_id: str) -> dict:
+        """Return ordered uploaded parts and any completed-upload receipt."""
+        return _loads(self._client.list_parts_json(upload_id))
+
+    def complete_multipart_upload(self, upload_id: str, parts: list[dict]) -> dict:
+        """Atomically publish all parts, consecutively numbered from 1.
+
+        Pass the part_number and etag returned by upload_part/list_parts.
+        Retrying the same completed manifest returns its original receipt.
+        """
+        manifest = json.dumps({"parts": [{"part_number": p["part_number"], "etag": p["etag"]} for p in parts]})
+        return _loads(self._client.complete_multipart_upload_json(upload_id, manifest))
+
+    def abort_multipart_upload(self, upload_id: str) -> None:
+        """Remove pending data (or a completion receipt), leaving published objects intact."""
+        self._client.abort_multipart_upload(upload_id)
+
     def health(self) -> dict:
         return _loads(self._client.health_json())
 
@@ -193,6 +223,36 @@ class ALocalS3ClientAsync:
     async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         await self.close()
 
+    async def create_multipart_upload(
+        self, bucket: str, key: str, content_type: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> dict:
+        """Create an unpublished upload session; persist its upload_id to resume."""
+        return _loads(await self._client.create_multipart_upload_json(bucket, key, content_type, metadata))
+
+    async def upload_part(self, upload_id: str, part_number: int, body: bytes | bytearray | memoryview) -> dict:
+        """Upload/replace a numbered part. No part size or count policy is imposed."""
+        if isinstance(part_number, bool) or not isinstance(part_number, int) or part_number < 1:
+            raise ValueError("part_number must be a positive integer")
+        return _loads(await self._client.upload_part_json(upload_id, part_number, bytes(body)))
+
+    async def list_parts(self, upload_id: str) -> dict:
+        """Return ordered uploaded parts and any completed-upload receipt."""
+        return _loads(await self._client.list_parts_json(upload_id))
+
+    async def complete_multipart_upload(self, upload_id: str, parts: list[dict]) -> dict:
+        """Atomically publish all parts, consecutively numbered from 1.
+
+        Pass the part_number and etag returned by upload_part/list_parts.
+        Retrying the same completed manifest returns its original receipt.
+        """
+        manifest = json.dumps({"parts": [{"part_number": p["part_number"], "etag": p["etag"]} for p in parts]})
+        return _loads(await self._client.complete_multipart_upload_json(upload_id, manifest))
+
+    async def abort_multipart_upload(self, upload_id: str) -> None:
+        """Remove pending data (or a completion receipt), leaving published objects intact."""
+        await self._client.abort_multipart_upload(upload_id)
+
     async def health(self) -> dict:
         return _loads(await self._client.health_json())
 
@@ -246,6 +306,15 @@ class ALocalS3ClientAsync:
 
     async def get_object(self, bucket: str, key: str, output_path: Path) -> None:
         await self._client.get_object_to_file(bucket, key, str(output_path), None)
+
+    async def head_object(self, bucket: str, key: str) -> dict[str, str]:
+        """Return lowercase HTTP response headers without downloading the object.
+
+        Includes content-length, etag, last-modified, content-type and any
+        x-amz-meta-* headers. HTTP errors (including 404) raise RuntimeError,
+        using the same ALOCALS3_HTTP_STATUS marker as other client methods.
+        """
+        return await self._client.head_object(bucket, key)
 
     async def get_object_bytes(self, bucket: str, key: str, range_header: str | None = None) -> tuple[bytes, dict]:
         return await self._client.get_object_bytes(bucket, key, range_header)

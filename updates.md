@@ -1,3 +1,9 @@
+# Version 0.9.5
+
+- Include `status`, `system` and `module` in the public `/healthz` response
+- Add `--health-system` / `ALOCALS3_HEALTH_SYSTEM` to identify the embedding platform; standalone servers default to `alocals3`
+- Preserve unauthenticated health probes; public identity fields do not replace authentication or process ownership checks
+
 # Version 0.9.4
 
 - Add native async `head_object` for metadata queries without downloading objects or listing buckets

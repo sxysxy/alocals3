@@ -512,3 +512,5 @@ and client builds before using this API.
 Run `python tests/test_multipart.py` after building/installing. Tests create
 an isolated SQLite database by default. Set `ALOCALS3_TEST_POSTGRES_URL` to use
 an isolated temporary PostgreSQL schema instead (requires psycopg for tests).
+
+`GET /healthz` returns `status`, `system` (default `alocals3`) and `module: "alocals3"`. Embedding applications may set `--health-system` / `ALOCALS3_HEALTH_SYSTEM` to their public system identity. This is identification, not authentication.

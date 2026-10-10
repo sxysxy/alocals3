@@ -93,6 +93,9 @@ struct Args {
     auth_enabled: bool,
     #[arg(long, env = "ALOCALS3_SERVICE_TOKEN", default_value = "")]
     service_token: String,
+    /// Public identity of the deployment embedding this generic storage service.
+    #[arg(long, env = "ALOCALS3_HEALTH_SYSTEM", default_value = "alocals3")]
+    health_system: String,
     #[arg(long, env = "ALOCALS3_USER_AUTH_SECRET", default_value = "")]
     user_auth_secret: String,
     #[arg(
@@ -105,6 +108,7 @@ struct Args {
 
 #[derive(Clone)]
 struct AppState {
+    health_system: String,
     storage: Arc<Storage>,
     gc: Option<Arc<GarbageCollector>>,
     auth: Arc<AuthConfig>,
@@ -638,6 +642,7 @@ async fn main() -> anyhow::Result<()> {
         ))
     };
     let state = AppState {
+        health_system: args.health_system,
         storage,
         gc,
         auth: Arc::new(AuthConfig {
@@ -684,8 +689,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status": "ok"}))
+async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status": "ok", "system": state.health_system, "module": "alocals3"}))
 }
 
 async fn list_buckets(State(state): State<AppState>) -> ApiResult<Json<Vec<BucketInfo>>> {

@@ -484,3 +484,5 @@ await client.abort_multipart_upload(upload_id)
 测试：先构建服务端并安装新客户端，再运行 `python tests/test_multipart.py`。
 默认使用隔离的 SQLite 临时数据库；设置 `ALOCALS3_TEST_POSTGRES_URL` 后使用指定
 PostgreSQL 数据库中的临时 schema，测试完成后删除，不使用业务表。
+
+`GET /healthz` 返回 `status`、`system`（默认 `alocals3`）及 `module: "alocals3"`。集成到其他平台时，可通过 `--health-system` 或 `ALOCALS3_HEALTH_SYSTEM` 设置所属系统的公开身份。这些字段用于识别，不是认证。

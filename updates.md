@@ -1,3 +1,17 @@
+# Version 0.10.0
+
+- Fix ListObjectsV2 continuation boundaries and delimiter paging; use bounded SQL range queries with deterministic UTF-8 ordering and context-bound opaque cursors.
+- Honor max-keys=0 and push simple object listing limits/prefixes into SQL.
+- Make conditional PUT and multipart completion atomic across server processes; coordinate copy, delete and missing-record GC with the same bucket write transactions.
+- Expose write preconditions on synchronous and async Python clients, and If-Match on object reads.
+- Add paginated incomplete-upload listings with stored byte/part counts and batch cancellation (up to 100 IDs).
+- Add opt-in idle multipart cleanup with cross-process activity locks; preserve active receivers and completed receipts.
+- Add read-only --verify / --verify-full inspection with JSON diagnostics and corruption exit status.
+- Stream client downloads into version-bound partial files, resume interrupted downloads with ETag/Range checks, validate checksums, and atomically replace destinations.
+- Add SQLite/PostgreSQL multi-process regressions and interrupted-download wire tests.
+- Keep HTTP requests working when a detached launcher closes both stdout/stderr log pipes; failed-log diagnostics must not panic in request tasks.
+- Add an actual-server regression for data requests and sampled health logs after both output pipes lose their reader.
+
 # Version 0.9.5
 
 - Include `status`, `system` and `module` in the public `/healthz` response

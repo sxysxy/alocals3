@@ -5,14 +5,15 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyModule};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
 use std::collections::HashMap;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
+mod download;
 mod python_async;
 use python_async::{RustHttpClientAsync, RustObjectReaderAsync, RustObjectWriterAsync};
 
@@ -102,19 +103,36 @@ impl RustHttpClient {
     }
 
     #[pyo3(signature = (bucket, key, content_type=None, metadata=None))]
-    fn create_multipart_upload_json(&self, bucket: &str, key: &str,
-        content_type: Option<&str>, metadata: Option<HashMap<String, String>>) -> PyResult<String> {
-        let url = self.url(&format!("/s3-multipart/{}/{}", encode_segment(bucket), encode_key(key)));
+    fn create_multipart_upload_json(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+        metadata: Option<HashMap<String, String>>,
+    ) -> PyResult<String> {
+        let url = self.url(&format!(
+            "/s3-multipart/{}/{}",
+            encode_segment(bucket),
+            encode_key(key)
+        ));
         let mut request = self.client.post(url);
-        if let Some(value) = content_type { request = request.header("content-type", value); }
+        if let Some(value) = content_type {
+            request = request.header("content-type", value);
+        }
         if let Some(metadata) = metadata {
-            for (key, value) in metadata { request = request.header(format!("x-amz-meta-{key}"), value); }
+            for (key, value) in metadata {
+                request = request.header(format!("x-amz-meta-{key}"), value);
+            }
         }
         self.request_json(request)
     }
 
     fn upload_part_json(&self, upload_id: &str, part_number: u64, body: &[u8]) -> PyResult<String> {
-        let url = self.url(&format!("/s3-uploads/{}/{}", encode_segment(upload_id), part_number));
+        let url = self.url(&format!(
+            "/s3-uploads/{}/{}",
+            encode_segment(upload_id),
+            part_number
+        ));
         self.request_json(self.stream_client.put(url).body(body.to_vec()))
     }
 
@@ -123,14 +141,57 @@ impl RustHttpClient {
         self.request_json(self.client.get(url))
     }
 
-    fn complete_multipart_upload_json(&self, upload_id: &str, manifest: &str) -> PyResult<String> {
+    #[pyo3(signature = (upload_id, manifest, if_match=None, if_none_match=None))]
+    fn complete_multipart_upload_json(
+        &self,
+        upload_id: &str,
+        manifest: &str,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> PyResult<String> {
         let url = self.url(&format!("/s3-uploads/{}", encode_segment(upload_id)));
-        self.request_json(self.stream_client.post(url).header("content-type", "application/json").body(manifest.to_string()))
+        let mut request = self
+            .stream_client
+            .post(url)
+            .header("content-type", "application/json")
+            .body(manifest.to_string());
+        if let Some(value) = if_match {
+            request = request.header("if-match", value);
+        }
+        if let Some(value) = if_none_match {
+            request = request.header("if-none-match", value);
+        }
+        self.request_json(request)
     }
 
     fn abort_multipart_upload(&self, upload_id: &str) -> PyResult<()> {
         let url = self.url(&format!("/s3-uploads/{}", encode_segment(upload_id)));
         self.request_empty(self.client.delete(url))
+    }
+
+    #[pyo3(signature = (bucket, limit=100, continuation_token=None))]
+    fn list_multipart_uploads_json(
+        &self,
+        bucket: &str,
+        limit: i64,
+        continuation_token: Option<&str>,
+    ) -> PyResult<String> {
+        self.request_json(self.client.get(self.url("/s3-uploads")).query(&[
+            ("bucket", bucket.to_string()),
+            ("limit", limit.to_string()),
+            (
+                "continuation_token",
+                continuation_token.unwrap_or("").to_string(),
+            ),
+        ]))
+    }
+    fn abort_multipart_uploads_json(&self, manifest: &str) -> PyResult<String> {
+        self.request_json(
+            self.client
+                .post(self.url("/s3-uploads/abort"))
+                .header("content-type", "application/json")
+                .body(manifest.to_owned()),
+        )
     }
 
     fn health_json(&self) -> PyResult<String> {
@@ -192,7 +253,7 @@ impl RustHttpClient {
         )
     }
 
-    #[pyo3(signature = (bucket, key, file_path, content_type=None, metadata=None))]
+    #[pyo3(signature = (bucket, key, file_path, content_type=None, metadata=None, if_match=None, if_none_match=None))]
     fn put_object_json(
         &self,
         bucket: &str,
@@ -200,6 +261,8 @@ impl RustHttpClient {
         file_path: &str,
         content_type: Option<&str>,
         metadata: Option<HashMap<String, String>>,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
     ) -> PyResult<String> {
         let body = fs::read(file_path).map_err(io_error)?;
         let mut request = self
@@ -214,10 +277,16 @@ impl RustHttpClient {
                 request = request.header(format!("x-amz-meta-{key}"), value);
             }
         }
+        if let Some(value) = if_match {
+            request = request.header("if-match", value);
+        }
+        if let Some(value) = if_none_match {
+            request = request.header("if-none-match", value);
+        }
         self.request_json(request)
     }
 
-    #[pyo3(signature = (bucket, key, body, content_type=None, metadata=None))]
+    #[pyo3(signature = (bucket, key, body, content_type=None, metadata=None, if_match=None, if_none_match=None))]
     fn put_object_bytes_json(
         &self,
         bucket: &str,
@@ -225,6 +294,8 @@ impl RustHttpClient {
         body: &[u8],
         content_type: Option<&str>,
         metadata: Option<HashMap<String, String>>,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
     ) -> PyResult<String> {
         let mut request = self
             .client
@@ -237,6 +308,12 @@ impl RustHttpClient {
             for (key, value) in metadata {
                 request = request.header(format!("x-amz-meta-{key}"), value);
             }
+        }
+        if let Some(value) = if_match {
+            request = request.header("if-match", value);
+        }
+        if let Some(value) = if_none_match {
+            request = request.header("if-none-match", value);
         }
         self.request_json(request)
     }
@@ -297,10 +374,8 @@ impl RustHttpClient {
         key: &str,
         content_type: Option<&str>,
     ) -> PyResult<RustObjectWriter> {
-        let temp_path = std::env::temp_dir().join(format!(
-            "alocals3-upload-{}.tmp",
-            Uuid::new_v4().simple()
-        ));
+        let temp_path =
+            std::env::temp_dir().join(format!("alocals3-upload-{}.tmp", Uuid::new_v4().simple()));
         let file = File::create(&temp_path).map_err(io_error)?;
         Ok(RustObjectWriter {
             client: self.stream_client.clone(),
@@ -314,7 +389,7 @@ impl RustHttpClient {
         })
     }
 
-    #[pyo3(signature = (bucket, key, output_path, range_header=None))]
+    #[pyo3(signature = (bucket, key, output_path, range_header=None, resume=true, max_retries=3))]
     fn get_object_to_file(
         &self,
         py: Python<'_>,
@@ -322,22 +397,24 @@ impl RustHttpClient {
         key: &str,
         output_path: &str,
         range_header: Option<&str>,
+        resume: bool,
+        max_retries: u32,
     ) -> PyResult<Py<PyAny>> {
-        let mut request = self.client.get(self.url(&object_path(bucket, key)));
-        if let Some(range_header) = range_header {
-            request = request.header(reqwest::header::RANGE, range_header);
-        }
-        let response = request.send().map_err(http_error)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(http_status_error(status.as_u16()));
-        }
-        let headers = response.headers().clone();
-        let body = response.bytes().map_err(http_error)?;
-        if let Some(parent) = Path::new(output_path).parent() {
-            fs::create_dir_all(parent).map_err(io_error)?;
-        }
-        fs::write(output_path, &body).map_err(io_error)?;
+        let headers = py.detach(|| match range_header {
+            Some(range) => download::blocking_range(
+                &self.stream_client,
+                &self.url(&object_path(bucket, key)),
+                Path::new(output_path),
+                range,
+            ),
+            None => download::blocking(
+                &self.stream_client,
+                &self.url(&object_path(bucket, key)),
+                Path::new(output_path),
+                resume,
+                max_retries,
+            ),
+        })?;
         headers_to_dict(py, &headers)
     }
 
@@ -392,11 +469,12 @@ impl RustHttpClient {
             .put(self.url(&object_path(destination_bucket, destination_key)))
             .query(&[("output", "json")])
             .header("x-amz-copy-source", source);
-        let directive = metadata_directive.unwrap_or(if metadata.is_some() || content_type.is_some() {
-            "REPLACE"
-        } else {
-            "COPY"
-        });
+        let directive =
+            metadata_directive.unwrap_or(if metadata.is_some() || content_type.is_some() {
+                "REPLACE"
+            } else {
+                "COPY"
+            });
         request = request.header("x-amz-metadata-directive", directive);
         if let Some(content_type) = content_type {
             request = request.header(reqwest::header::CONTENT_TYPE, content_type);
@@ -493,7 +571,8 @@ impl RustObjectReader {
         let result = if view.len <= 0 || view.buf.is_null() {
             Ok(0)
         } else {
-            let dst = unsafe { std::slice::from_raw_parts_mut(view.buf.cast::<u8>(), view.len as usize) };
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(view.buf.cast::<u8>(), view.len as usize) };
             py.detach(|| response.read(dst)).map_err(io_error)
         };
         unsafe {
@@ -549,24 +628,23 @@ impl RustObjectWriter {
         let client = self.client.clone();
         let url = self.url.clone();
         let content_type = self.content_type.clone();
-        let result = py
-            .detach(move || -> Result<String, PyErr> {
-                let len = fs::metadata(&temp_path).map_err(io_error)?.len();
-                let file = File::open(&temp_path).map_err(io_error)?;
-                let mut request = client
-                    .put(url)
-                    .header(reqwest::header::CONTENT_LENGTH, len)
-                    .body(reqwest::blocking::Body::new(file));
-                if let Some(content_type) = content_type {
-                    request = request.header(reqwest::header::CONTENT_TYPE, content_type);
-                }
-                let response = request.send().map_err(http_error)?;
-                let status = response.status();
-                if !status.is_success() {
-                    return Err(http_status_error(status.as_u16()));
-                }
-                response.text().map_err(http_error)
-            })?;
+        let result = py.detach(move || -> Result<String, PyErr> {
+            let len = fs::metadata(&temp_path).map_err(io_error)?.len();
+            let file = File::open(&temp_path).map_err(io_error)?;
+            let mut request = client
+                .put(url)
+                .header(reqwest::header::CONTENT_LENGTH, len)
+                .body(reqwest::blocking::Body::new(file));
+            if let Some(content_type) = content_type {
+                request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+            }
+            let response = request.send().map_err(http_error)?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(http_status_error(status.as_u16()));
+            }
+            response.text().map_err(http_error)
+        })?;
         self.closed = true;
         self.uploaded = true;
         self.result_json = Some(result.clone());

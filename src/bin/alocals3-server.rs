@@ -1,4 +1,83 @@
+// The first statement takes a database write lock before any snapshot read.
+// PostgreSQL serializes only writers in this bucket; SQLite serializes writers.
+macro_rules! database {
+    ($storage:expr, $pool:ident, $body:block) => {
+        match $storage {
+            Storage::Sqlite { pool: $pool, .. } => $body,
+            Storage::Postgres { pool: $pool, .. } => $body,
+        }
+    };
+}
+macro_rules! lock_bucket {
+    ($tx:expr, $id:expr) => {{
+        let result = sqlx::query("UPDATE buckets SET name = name WHERE id = $1")
+            .bind($id)
+            .execute(&mut *$tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "Bucket not found"));
+        }
+    }};
+}
+// Caller owns a bucket write lock for the entire check-and-publish transaction.
+macro_rules! publish_object {
+    ($tx:expr, $id:expr, $key:expr, $path:expr, $info:expr, $conditions:expr) => {{
+        let old = sqlx::query("SELECT etag, file_path FROM objects WHERE bucket_id = $1 AND key = $2")
+            .bind($id).bind($key).fetch_optional(&mut *$tx).await?;
+        let etag = old.as_ref().map(|r| r.get::<String, _>(0));
+        $conditions.check(etag.as_deref())?;
+        let metadata = serde_json::to_string(&$info.metadata)
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        sqlx::query("INSERT INTO objects (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at, metadata)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)
+            ON CONFLICT(bucket_id, key) DO UPDATE SET file_path = EXCLUDED.file_path,
+            size = EXCLUDED.size, content_type = EXCLUDED.content_type, etag = EXCLUDED.etag,
+            updated_at = EXCLUDED.updated_at, metadata = EXCLUDED.metadata")
+            .bind($id).bind($key).bind($path).bind($info.size).bind(&$info.content_type)
+            .bind(&$info.etag).bind(&$info.updated_at).bind(metadata).execute(&mut *$tx).await?;
+        (old.is_none(), old.map(|r| r.get::<String, _>(1)).filter(|p| p != $path))
+    }};
+}
+
+#[derive(Default)]
+struct WriteConditions {
+    if_match: Option<String>,
+    if_none_match: Option<String>,
+}
+impl WriteConditions {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            if_match: header_str(headers, "if-match").map(str::to_owned),
+            if_none_match: header_str(headers, "if-none-match").map(str::to_owned),
+        }
+    }
+    fn check(&self, current: Option<&str>) -> ApiResult<()> {
+        if self
+            .if_match
+            .as_ref()
+            .is_some_and(|v| !current.is_some_and(|e| strong_etag_matches(v, e)))
+            || self
+                .if_none_match
+                .as_ref()
+                .is_some_and(|v| current.is_some_and(|e| strong_etag_matches(v, e)))
+        {
+            return Err(ApiError::new(
+                StatusCode::PRECONDITION_FAILED,
+                "Write precondition failed",
+            ));
+        }
+        Ok(())
+    }
+}
+fn strong_etag_matches(value: &str, etag: &str) -> bool {
+    value
+        .split(',')
+        .map(str::trim)
+        .any(|v| v == "*" || (!v.starts_with("W/") && v.trim_matches('"') == etag))
+}
+
 mod multipart;
+mod verify;
 
 use axum::body::Body;
 use axum::extract::{OriginalUri, Path as AxumPath, Query, State};
@@ -56,6 +135,21 @@ fn version_info() -> &'static str {
 struct Args {
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
+    /// Inspect stored objects and exit (JSON report, exit 1 on corruption).
+    #[arg(long)]
+    verify: bool,
+    /// Read and hash every blob during verification.
+    #[arg(long)]
+    verify_full: bool,
+    /// Expire idle incomplete multipart uploads; 0 disables automatic cleanup.
+    #[arg(long, env = "ALOCALS3_MULTIPART_IDLE_SECS", default_value_t = 0)]
+    multipart_idle_secs: u64,
+    #[arg(
+        long,
+        env = "ALOCALS3_MULTIPART_CLEANUP_INTERVAL_SECS",
+        default_value_t = 60
+    )]
+    multipart_cleanup_interval_secs: u64,
     #[arg(long, default_value_t = 8000)]
     port: u16,
     #[arg(
@@ -399,6 +493,10 @@ fn init_logging(log_level: &str) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
+        // A detached launcher may close both output pipes. Reporting a failed
+        // log write to stderr can then panic inside a request task, dropping
+        // its HTTP connection. Logging failures must never abort storage I/O.
+        .log_internal_errors(false)
         .try_init()
         .map_err(|err| anyhow::anyhow!("failed to initialize logging: {err}"))?;
     Ok(())
@@ -608,6 +706,17 @@ async fn request_authorization(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if args.verify || args.verify_full {
+        let storage = verify::connect(&args.database_url, args.storage_root).await?;
+        let report = verify::run(&storage, args.verify_full)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.detail))?;
+        println!("{}", serde_json::to_string(&report)?);
+        if !report.issues.is_empty() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.auth_enabled && args.service_token.trim().is_empty() {
         anyhow::bail!("--service-token is required when --auth-enabled=true");
     }
@@ -630,6 +739,13 @@ async fn main() -> anyhow::Result<()> {
         "starting alocals3 server"
     );
     let storage = Arc::new(Storage::connect(&args.database_url, args.storage_root).await?);
+    if args.multipart_idle_secs > 0 {
+        multipart::start_cleanup(
+            storage.clone(),
+            Duration::from_secs(args.multipart_idle_secs),
+            Duration::from_secs(args.multipart_cleanup_interval_secs.max(1)),
+        );
+    }
     let gc = if args.disable_gc || args.gc_interval_secs == 0 {
         tracing::info!("background gc disabled");
         None
@@ -657,9 +773,26 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/s3", get(list_buckets))
-        .route("/s3-multipart/:bucket/*key", axum::routing::post(multipart::create))
-        .route("/s3-uploads/:upload_id", get(multipart::list).delete(multipart::abort).post(multipart::complete).layer(axum::extract::DefaultBodyLimit::disable()))
-        .route("/s3-uploads/:upload_id/:part_number", put(multipart::upload_part))
+        .route(
+            "/s3-multipart/:bucket/*key",
+            axum::routing::post(multipart::create),
+        )
+        .route("/s3-uploads", get(multipart::list_uploads))
+        .route(
+            "/s3-uploads/abort",
+            axum::routing::post(multipart::abort_many),
+        )
+        .route(
+            "/s3-uploads/:upload_id",
+            get(multipart::list)
+                .delete(multipart::abort)
+                .post(multipart::complete)
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/s3-uploads/:upload_id/:part_number",
+            put(multipart::upload_part),
+        )
         .route(
             "/s3/:bucket",
             put(create_bucket)
@@ -753,7 +886,7 @@ async fn list_objects_v2(
         .get("max-keys")
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(1000)
-        .clamp(1, 10000);
+        .clamp(0, 10000);
     let continuation_token = params.get("continuation-token").cloned();
     let result = state
         .storage
@@ -851,31 +984,7 @@ async fn put_object(
 
     validate_content_length(&headers, state.max_upload_size)?;
     let expected_md5 = parse_content_md5(&headers)?;
-    let existing = state.storage.get_object_info(&bucket, &key).await?;
-
-    if let Some(value) = header_str(&headers, header::IF_NONE_MATCH.as_str()) {
-        if let Some(info) = &existing {
-            if etag_matches(value, &info.etag) {
-                return Err(ApiError::new(
-                    StatusCode::PRECONDITION_FAILED,
-                    "If-None-Match precondition failed",
-                ));
-            }
-        }
-    }
-    if let Some(value) = header_str(&headers, header::IF_MATCH.as_str()) {
-        if !existing
-            .as_ref()
-            .map(|info| etag_matches(value, &info.etag))
-            .unwrap_or(false)
-        {
-            return Err(ApiError::new(
-                StatusCode::PRECONDITION_FAILED,
-                "If-Match precondition failed",
-            ));
-        }
-    }
-
+    let conditions = WriteConditions::from_headers(&headers);
     let content_type = header_str(&headers, header::CONTENT_TYPE.as_str()).map(str::to_string);
     let metadata = extract_user_metadata(&headers)?;
     let _upload_permit = state.upload_semaphore.acquire().await.map_err(|_| {
@@ -893,7 +1002,14 @@ async fn put_object(
     .await?;
     let (info, created, retired_path) = state
         .storage
-        .put_staged_object(&bucket, &key, staged, content_type.as_deref(), metadata)
+        .put_staged_object(
+            &bucket,
+            &key,
+            staged,
+            content_type.as_deref(),
+            metadata,
+            &conditions,
+        )
         .await?;
     if let (Some(gc), Some(path)) = (&state.gc, retired_path) {
         gc.reclaim_path(path);
@@ -1276,24 +1392,24 @@ impl Storage {
     async fn delete_bucket(&self, bucket: &str) -> ApiResult<()> {
         validate_bucket(bucket)?;
         let bucket_row = self.bucket_row(bucket).await?;
-        if self.object_count(bucket_row.id).await? > 0 {
-            return Err(ApiError::new(StatusCode::CONFLICT, "Bucket is not empty"));
-        }
-        match self {
-            Self::Sqlite { pool, .. } => {
-                sqlx::query("DELETE FROM buckets WHERE id = ?1")
-                    .bind(bucket_row.id)
-                    .execute(pool)
-                    .await?;
+        database!(self, pool, {
+            let mut tx = pool.begin().await?;
+            lock_bucket!(tx, bucket_row.id);
+            let count: i64 = sqlx::query("SELECT COUNT(*) FROM objects WHERE bucket_id = $1")
+                .bind(bucket_row.id)
+                .fetch_one(&mut *tx)
+                .await?
+                .get(0);
+            if count > 0 {
+                return Err(ApiError::new(StatusCode::CONFLICT, "Bucket is not empty"));
             }
-            Self::Postgres { pool, .. } => {
-                sqlx::query("DELETE FROM buckets WHERE id = $1")
-                    .bind(bucket_row.id)
-                    .execute(pool)
-                    .await?;
-            }
-        }
-        Ok(())
+            sqlx::query("DELETE FROM buckets WHERE id = $1")
+                .bind(bucket_row.id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(())
+        })
     }
 
     async fn list_objects(
@@ -1303,12 +1419,16 @@ impl Storage {
         limit: i64,
     ) -> ApiResult<Vec<ObjectInfo>> {
         let bucket_row = self.bucket_row(bucket).await?;
-        let rows = self.object_rows(bucket_row.id).await?;
-        let prefix = prefix.unwrap_or("");
-        Ok(rows
+        Ok(self
+            .object_page(
+                bucket_row.id,
+                prefix.unwrap_or(""),
+                prefix.unwrap_or(""),
+                true,
+                limit,
+            )
+            .await?
             .into_iter()
-            .filter(|row| prefix.is_empty() || row.key.starts_with(prefix))
-            .take(limit as usize)
             .map(|row| row.info(bucket))
             .collect())
     }
@@ -1321,61 +1441,115 @@ impl Storage {
         max_keys: i64,
         continuation_token: Option<&str>,
     ) -> ApiResult<ListObjectsV2Result> {
-        let bucket_row = self.bucket_row(bucket).await?;
-        let rows = self.object_rows(bucket_row.id).await?;
+        let bucket_id = self.bucket_row(bucket).await?.id;
+        let mut cursor = match continuation_token {
+            Some(value) => ListCursor::decode(value, bucket, prefix, delimiter)?,
+            None => ListCursor {
+                bucket: bucket.to_owned(),
+                prefix: prefix.to_owned(),
+                delimiter: delimiter.to_owned(),
+                lower: prefix.to_owned(),
+                inclusive: true,
+            },
+        };
         let mut contents = Vec::new();
         let mut common_prefixes = Vec::new();
-        let mut seen = HashSet::new();
-        let mut key_count = 0_i64;
         let mut next_token = None;
-
-        for row in rows {
-            if !prefix.is_empty() && !row.key.starts_with(prefix) {
-                continue;
-            }
-            if continuation_token
-                .map(|token| row.key.as_str() <= token)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            if !delimiter.is_empty() {
-                let tail = if !prefix.is_empty() && row.key.starts_with(prefix) {
-                    &row.key[prefix.len()..]
-                } else {
-                    row.key.as_str()
-                };
-                if let Some(pos) = tail.find(delimiter) {
-                    let cp = row.key[..prefix.len() + pos + delimiter.len()].to_string();
-                    if seen.insert(cp.clone()) {
-                        if key_count >= max_keys {
-                            next_token = Some(row.key);
-                            break;
-                        }
-                        common_prefixes.push(cp);
-                        key_count += 1;
-                    }
-                    continue;
-                }
-            }
-            if key_count >= max_keys {
-                next_token = Some(row.key);
+        let mut exhausted = max_keys == 0;
+        while !exhausted {
+            let rows = self
+                .object_page(bucket_id, prefix, &cursor.lower, cursor.inclusive, 256)
+                .await?;
+            if rows.is_empty() {
                 break;
             }
-            contents.push(row.info(bucket));
-            key_count += 1;
+            for row in rows {
+                if row.key < cursor.lower || (!cursor.inclusive && row.key == cursor.lower) {
+                    continue;
+                }
+                if contents.len() + common_prefixes.len() >= max_keys as usize {
+                    next_token = Some(cursor.encode());
+                    exhausted = true;
+                    break;
+                }
+                if let Some(pos) = (!delimiter.is_empty())
+                    .then(|| row.key[prefix.len()..].find(delimiter))
+                    .flatten()
+                {
+                    let cp = row.key[..prefix.len() + pos + delimiter.len()].to_owned();
+                    // Seek past the entire directory, including entries not in this SQL page.
+                    match prefix_upper_bound(&cp) {
+                        Some(upper) => {
+                            cursor.lower = upper;
+                            cursor.inclusive = true;
+                        }
+                        None => exhausted = true,
+                    }
+                    common_prefixes.push(cp);
+                } else {
+                    cursor.lower = row.key.clone();
+                    cursor.inclusive = false;
+                    contents.push(row.info(bucket));
+                }
+                if exhausted {
+                    break;
+                }
+            }
         }
-
         Ok(ListObjectsV2Result {
-            bucket: bucket.to_string(),
-            prefix: prefix.to_string(),
-            delimiter: delimiter.to_string(),
+            bucket: bucket.to_owned(),
+            prefix: prefix.to_owned(),
+            delimiter: delimiter.to_owned(),
             max_keys,
-            key_count,
+            key_count: (contents.len() + common_prefixes.len()) as i64,
             is_truncated: next_token.is_some(),
             next_continuation_token: next_token,
             contents,
             common_prefixes,
+        })
+    }
+
+    async fn object_page(
+        &self,
+        bucket_id: i64,
+        prefix: &str,
+        lower: &str,
+        inclusive: bool,
+        limit: i64,
+    ) -> ApiResult<Vec<ObjectRow>> {
+        let collation = match self {
+            Self::Sqlite { .. } => "BINARY",
+            Self::Postgres { .. } => "\"C\"",
+        };
+        let key = format!("key COLLATE {collation}");
+        let comparison = if inclusive { ">=" } else { ">" };
+        let query = format!(
+            "SELECT key, file_path, size, content_type, etag, updated_at, metadata FROM objects
+            WHERE bucket_id = $1 AND {key} >= $2 AND (CAST($3 AS TEXT) IS NULL OR {key} < $3)
+            AND {key} {comparison} $4 ORDER BY {key} ASC LIMIT $5"
+        );
+        let upper = prefix_upper_bound(prefix);
+        database!(self, pool, {
+            let rows = sqlx::query(&query)
+                .bind(bucket_id)
+                .bind(prefix)
+                .bind(upper.as_deref())
+                .bind(lower)
+                .bind(limit)
+                .fetch_all(pool)
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|row| ObjectRow {
+                    key: row.get(0),
+                    file_path: row.get(1),
+                    size: row.get(2),
+                    content_type: row.get(3),
+                    etag: row.get(4),
+                    updated_at: row.get(5),
+                    metadata: metadata_from_json(row.get(6)),
+                })
+                .collect())
         })
     }
 
@@ -1386,14 +1560,11 @@ impl Storage {
         mut staged: StagedUpload,
         content_type: Option<&str>,
         metadata: HashMap<String, String>,
+        conditions: &WriteConditions,
     ) -> ApiResult<(ObjectInfo, bool, Option<String>)> {
         validate_bucket(bucket)?;
         let normalized_key = normalize_key(key)?;
         let bucket_row = self.bucket_row(bucket).await?;
-        let previous_path = self
-            .object_row_optional(bucket_row.id, &normalized_key)
-            .await?
-            .map(|row| row.file_path);
         let relative_path = format!(
             "{}/{}/{}",
             &staged.sha256[..2],
@@ -1411,21 +1582,29 @@ impl Storage {
                     .unwrap_or("application/octet-stream")
                     .to_string()
             });
-            let created = self
-                .upsert_object(
+            let info = ObjectInfo {
+                bucket: bucket.to_string(),
+                key: normalized_key.clone(),
+                size: staged.size,
+                content_type: final_content_type,
+                etag: staged.etag.clone(),
+                updated_at: now,
+                metadata,
+            };
+            database!(self, pool, {
+                let mut tx = pool.begin().await?;
+                lock_bucket!(tx, bucket_row.id);
+                let (created, retired_path) = publish_object!(
+                    tx,
                     bucket_row.id,
                     &normalized_key,
                     &relative_path,
-                    staged.size,
-                    &final_content_type,
-                    &staged.etag,
-                    &now,
-                    &metadata,
-                )
-                .await?;
-            let row = self.object_row(bucket_row.id, &normalized_key).await?;
-            let retired_path = previous_path.filter(|path| path != &relative_path);
-            Ok((row.info(bucket), created, retired_path))
+                    info,
+                    conditions
+                );
+                tx.commit().await?;
+                Ok((info, created, retired_path))
+            })
         }
         .await;
         self.unregister_active_write(&relative_path).await;
@@ -1442,8 +1621,15 @@ impl Storage {
         metadata: HashMap<String, String>,
     ) -> ApiResult<(ObjectInfo, bool, Option<String>)> {
         let staged = stage_upload(&self.objects_root(), Body::from(body.to_vec()), 0, None).await?;
-        self.put_staged_object(bucket, key, staged, content_type, metadata)
-            .await
+        self.put_staged_object(
+            bucket,
+            key,
+            staged,
+            content_type,
+            metadata,
+            &WriteConditions::default(),
+        )
+        .await
     }
 
     async fn copy_object(
@@ -1466,10 +1652,6 @@ impl Storage {
             Ok(metadata) if metadata.is_file() => {}
             _ => return Err(ApiError::new(StatusCode::NOT_FOUND, "Object data missing")),
         }
-        let previous_path = self
-            .object_row_optional(destination_bucket_row.id, &destination_key)
-            .await?
-            .map(|row| row.file_path);
         let now = now_utc();
         let replacement_metadata_json = replacement_metadata
             .as_ref()
@@ -1482,66 +1664,49 @@ impl Storage {
                 )
             })?;
 
-        // A copy only creates a second database reference to the content-addressed
-        // blob. INSERT ... SELECT is one statement so concurrent source deletion
-        // cannot leave a destination reference to a reclaimed blob.
-        let row = match self {
-            Self::Sqlite { pool, .. } => sqlx::query(
-                "INSERT INTO objects
-                 (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at, metadata)
-                 SELECT ?3, ?4, file_path, size, COALESCE(?5, content_type), etag, ?7, ?7,
-                        COALESCE(?6, metadata)
-                 FROM objects WHERE bucket_id = ?1 AND key = ?2
-                 ON CONFLICT(bucket_id, key) DO UPDATE SET
-                    file_path = excluded.file_path, size = excluded.size,
-                    content_type = excluded.content_type, etag = excluded.etag,
-                    updated_at = excluded.updated_at, metadata = excluded.metadata
-                 RETURNING key, file_path, size, content_type, etag, updated_at, metadata",
-            )
-            .bind(source_bucket_row.id)
-            .bind(&source_key)
-            .bind(destination_bucket_row.id)
-            .bind(&destination_key)
-            .bind(replacement_content_type)
-            .bind(replacement_metadata_json.as_deref())
-            .bind(&now)
-            .fetch_optional(pool)
-            .await?
-            .map(object_row_from_sqlite),
-            Self::Postgres { pool, .. } => sqlx::query(
-                "WITH source AS (
-                    SELECT file_path, size, content_type, etag, metadata
-                    FROM objects WHERE bucket_id = $1 AND key = $2 FOR SHARE
-                 )
-                 INSERT INTO objects
-                 (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at, metadata)
-                 SELECT $3, $4, file_path, size, COALESCE($5, content_type), etag, $7, $7,
-                        COALESCE($6, metadata)
-                 FROM source
-                 ON CONFLICT(bucket_id, key) DO UPDATE SET
-                    file_path = EXCLUDED.file_path, size = EXCLUDED.size,
-                    content_type = EXCLUDED.content_type, etag = EXCLUDED.etag,
-                    updated_at = EXCLUDED.updated_at, metadata = EXCLUDED.metadata
-                 RETURNING key, file_path, size, content_type, etag, updated_at, metadata",
-            )
-            .bind(source_bucket_row.id)
-            .bind(&source_key)
-            .bind(destination_bucket_row.id)
-            .bind(&destination_key)
-            .bind(replacement_content_type)
-            .bind(replacement_metadata_json.as_deref())
-            .bind(&now)
-            .fetch_optional(pool)
-            .await?
-            .map(object_row_from_pg),
-        }
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Object not found"))?;
-        match tokio::fs::metadata(self.objects_root().join(&row.file_path)).await {
-            Ok(metadata) if metadata.is_file() => {}
-            _ => return Err(ApiError::new(StatusCode::NOT_FOUND, "Object data missing")),
-        }
-        let retired_path = previous_path.filter(|path| path != &row.file_path);
-        Ok((row.info(destination_bucket), retired_path))
+        database!(self, pool, {
+            let mut tx = pool.begin().await?;
+            for id in [
+                source_bucket_row.id.min(destination_bucket_row.id),
+                source_bucket_row.id.max(destination_bucket_row.id),
+            ] {
+                lock_bucket!(tx, id);
+            }
+            let previous =
+                sqlx::query("SELECT file_path FROM objects WHERE bucket_id = $1 AND key = $2")
+                    .bind(destination_bucket_row.id)
+                    .bind(&destination_key)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .map(|r| r.get::<String, _>(0));
+            let row = sqlx::query("INSERT INTO objects
+                (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at, metadata)
+                SELECT $3, $4, file_path, size, COALESCE($5, content_type), etag, $7, $7, COALESCE($6, metadata)
+                FROM objects WHERE bucket_id = $1 AND key = $2
+                ON CONFLICT(bucket_id, key) DO UPDATE SET file_path = EXCLUDED.file_path, size = EXCLUDED.size,
+                content_type = EXCLUDED.content_type, etag = EXCLUDED.etag, updated_at = EXCLUDED.updated_at, metadata = EXCLUDED.metadata
+                RETURNING key, file_path, size, content_type, etag, updated_at, metadata")
+                .bind(source_bucket_row.id).bind(&source_key).bind(destination_bucket_row.id).bind(&destination_key)
+                .bind(replacement_content_type).bind(replacement_metadata_json.as_deref()).bind(&now)
+                .fetch_optional(&mut *tx).await?
+                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Object not found"))?;
+            let row = ObjectRow {
+                key: row.get(0),
+                file_path: row.get(1),
+                size: row.get(2),
+                content_type: row.get(3),
+                etag: row.get(4),
+                updated_at: row.get(5),
+                metadata: metadata_from_json(row.get(6)),
+            };
+            match tokio::fs::metadata(self.objects_root().join(&row.file_path)).await {
+                Ok(metadata) if metadata.is_file() => {}
+                _ => return Err(ApiError::new(StatusCode::NOT_FOUND, "Object data missing")),
+            }
+            tx.commit().await?;
+            let retired = previous.filter(|p| p != &row.file_path);
+            Ok((row.info(destination_bucket), retired))
+        })
     }
 
     #[cfg(test)]
@@ -1589,29 +1754,21 @@ impl Storage {
         validate_bucket(bucket)?;
         let normalized_key = normalize_key(key)?;
         let bucket_row = self.bucket_row(bucket).await?;
-        let previous = self.object_row(bucket_row.id, &normalized_key).await?;
-        let changed = match self {
-            Self::Sqlite { pool, .. } => {
-                sqlx::query("DELETE FROM objects WHERE bucket_id = ?1 AND key = ?2")
-                    .bind(bucket_row.id)
-                    .bind(&normalized_key)
-                    .execute(pool)
-                    .await?
-                    .rows_affected()
-            }
-            Self::Postgres { pool, .. } => {
-                sqlx::query("DELETE FROM objects WHERE bucket_id = $1 AND key = $2")
-                    .bind(bucket_row.id)
-                    .bind(&normalized_key)
-                    .execute(pool)
-                    .await?
-                    .rows_affected()
-            }
-        };
-        if changed == 0 {
-            return Err(ApiError::new(StatusCode::NOT_FOUND, "Object not found"));
-        }
-        Ok(previous.file_path)
+        database!(self, pool, {
+            let mut tx = pool.begin().await?;
+            lock_bucket!(tx, bucket_row.id);
+            let row = sqlx::query(
+                "DELETE FROM objects WHERE bucket_id = $1 AND key = $2 RETURNING file_path",
+            )
+            .bind(bucket_row.id)
+            .bind(&normalized_key)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Object not found"))?;
+            let path: String = row.get(0);
+            tx.commit().await?;
+            Ok(path)
+        })
     }
 
     async fn reclaim_unreferenced_path(&self, relative_path: &str) -> ApiResult<Option<u64>> {
@@ -1835,44 +1992,6 @@ impl Storage {
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Bucket not found"))
     }
 
-    async fn object_count(&self, bucket_id: i64) -> ApiResult<i64> {
-        match self {
-            Self::Sqlite { pool, .. } => {
-                let row = sqlx::query("SELECT COUNT(*) FROM objects WHERE bucket_id = ?1")
-                    .bind(bucket_id)
-                    .fetch_one(pool)
-                    .await?;
-                Ok(row.get(0))
-            }
-            Self::Postgres { pool, .. } => {
-                let row = sqlx::query("SELECT COUNT(*) FROM objects WHERE bucket_id = $1")
-                    .bind(bucket_id)
-                    .fetch_one(pool)
-                    .await?;
-                Ok(row.get(0))
-            }
-        }
-    }
-
-    async fn object_rows(&self, bucket_id: i64) -> ApiResult<Vec<ObjectRow>> {
-        match self {
-            Self::Sqlite { pool, .. } => {
-                let rows = sqlx::query("SELECT key, file_path, size, content_type, etag, updated_at, metadata FROM objects WHERE bucket_id = ?1 ORDER BY key ASC")
-                    .bind(bucket_id)
-                    .fetch_all(pool)
-                    .await?;
-                Ok(rows.into_iter().map(object_row_from_sqlite).collect())
-            }
-            Self::Postgres { pool, .. } => {
-                let rows = sqlx::query("SELECT key, file_path, size, content_type, etag, updated_at, metadata FROM objects WHERE bucket_id = $1 ORDER BY key ASC")
-                    .bind(bucket_id)
-                    .fetch_all(pool)
-                    .await?;
-                Ok(rows.into_iter().map(object_row_from_pg).collect())
-            }
-        }
-    }
-
     async fn object_row(&self, bucket_id: i64, key: &str) -> ApiResult<ObjectRow> {
         self.object_row_optional(bucket_id, key)
             .await?
@@ -1958,99 +2077,23 @@ impl Storage {
         file_path: &str,
         updated_at: &str,
     ) -> ApiResult<u64> {
-        let rows_affected = match self {
-            Self::Sqlite { pool, .. } => sqlx::query(
-                "DELETE FROM objects WHERE id = ?1 AND file_path = ?2 AND updated_at = ?3",
-            )
-            .bind(id)
-            .bind(file_path)
-            .bind(updated_at)
-            .execute(pool)
-            .await?
-            .rows_affected(),
-            Self::Postgres { pool, .. } => sqlx::query(
+        database!(self, pool, {
+            let mut tx = pool.begin().await?;
+            // Participate in the same write ordering as conditional PUT/complete.
+            sqlx::query("UPDATE buckets SET name = name WHERE id = (SELECT bucket_id FROM objects WHERE id = $1)")
+                .bind(id).execute(&mut *tx).await?;
+            let count = sqlx::query(
                 "DELETE FROM objects WHERE id = $1 AND file_path = $2 AND updated_at = $3",
             )
             .bind(id)
             .bind(file_path)
             .bind(updated_at)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?
-            .rows_affected(),
-        };
-        Ok(rows_affected)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn upsert_object(
-        &self,
-        bucket_id: i64,
-        key: &str,
-        file_path: &str,
-        size: i64,
-        content_type: &str,
-        etag: &str,
-        updated_at: &str,
-        metadata: &HashMap<String, String>,
-    ) -> ApiResult<bool> {
-        let metadata_json = serde_json::to_string(metadata).map_err(|err| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Metadata serialization error: {err}"),
-            )
-        })?;
-        match self {
-            Self::Sqlite { pool, .. } => {
-                let result = sqlx::query(
-                    "INSERT INTO objects (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at, metadata)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
-                     ON CONFLICT(bucket_id, key) DO UPDATE SET
-                        file_path = excluded.file_path,
-                        size = excluded.size,
-                        content_type = excluded.content_type,
-                        etag = excluded.etag,
-                        updated_at = excluded.updated_at,
-                        metadata = excluded.metadata
-                     RETURNING created_at = updated_at",
-                )
-                .bind(bucket_id)
-                .bind(key)
-                .bind(file_path)
-                .bind(size)
-                .bind(content_type)
-                .bind(etag)
-                .bind(updated_at)
-                .bind(&metadata_json)
-                .fetch_one(pool)
-                .await?;
-                Ok(result.get(0))
-            }
-            Self::Postgres { pool, .. } => {
-                let row = sqlx::query(
-                    "INSERT INTO objects (bucket_id, key, file_path, size, content_type, etag, updated_at, created_at, metadata)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)
-                     ON CONFLICT(bucket_id, key) DO UPDATE SET
-                        file_path = EXCLUDED.file_path,
-                        size = EXCLUDED.size,
-                        content_type = EXCLUDED.content_type,
-                        etag = EXCLUDED.etag,
-                        updated_at = EXCLUDED.updated_at,
-                        metadata = EXCLUDED.metadata
-                     RETURNING xmax = 0",
-                )
-                .bind(bucket_id)
-                .bind(key)
-                .bind(file_path)
-                .bind(size)
-                .bind(content_type)
-                .bind(etag)
-                .bind(updated_at)
-                .bind(&metadata_json)
-                .fetch_one(pool)
-                .await?;
-                Ok(row.get(0))
-            }
-        }
+            .rows_affected();
+            tx.commit().await?;
+            Ok(count)
+        })
     }
 }
 
@@ -2151,18 +2194,38 @@ async fn init_sqlite(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_file_path ON objects (file_path)")
         .execute(pool)
         .await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS pending_uploads (
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS pending_uploads (
  upload_id TEXT PRIMARY KEY, bucket_id BIGINT NOT NULL REFERENCES buckets(id) ON DELETE CASCADE,
- session TEXT NOT NULL)").execute(pool).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS pending_upload_parts (
+ session TEXT NOT NULL)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS pending_upload_parts (
  upload_id TEXT NOT NULL REFERENCES pending_uploads(upload_id) ON DELETE CASCADE,
  part_number BIGINT NOT NULL, etag TEXT NOT NULL, size BIGINT NOT NULL, file TEXT NOT NULL,
- PRIMARY KEY(upload_id, part_number))").execute(pool).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS completed_uploads (
+ PRIMARY KEY(upload_id, part_number))",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS completed_uploads (
  upload_id TEXT PRIMARY KEY, bucket_id BIGINT NOT NULL REFERENCES buckets(id) ON DELETE CASCADE,
- session TEXT NOT NULL)").execute(pool).await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_pending_uploads_bucket ON pending_uploads(bucket_id)").execute(pool).await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_completed_uploads_bucket ON completed_uploads(bucket_id)").execute(pool).await?;
+ session TEXT NOT NULL)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_pending_uploads_bucket ON pending_uploads(bucket_id)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_completed_uploads_bucket ON completed_uploads(bucket_id)",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -2205,18 +2268,39 @@ async fn init_pg(pool: &PgPool) -> anyhow::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_file_path ON objects (file_path)")
         .execute(pool)
         .await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS pending_uploads (
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS pending_uploads (
  upload_id TEXT PRIMARY KEY, bucket_id BIGINT NOT NULL REFERENCES buckets(id) ON DELETE CASCADE,
- session TEXT NOT NULL)").execute(pool).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS pending_upload_parts (
+ session TEXT NOT NULL)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS pending_upload_parts (
  upload_id TEXT NOT NULL REFERENCES pending_uploads(upload_id) ON DELETE CASCADE,
  part_number BIGINT NOT NULL, etag TEXT NOT NULL, size BIGINT NOT NULL, file TEXT NOT NULL,
- PRIMARY KEY(upload_id, part_number))").execute(pool).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS completed_uploads (
+ PRIMARY KEY(upload_id, part_number))",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS completed_uploads (
  upload_id TEXT PRIMARY KEY, bucket_id BIGINT NOT NULL REFERENCES buckets(id) ON DELETE CASCADE,
- session TEXT NOT NULL)").execute(pool).await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_pending_uploads_bucket ON pending_uploads(bucket_id)").execute(pool).await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_completed_uploads_bucket ON completed_uploads(bucket_id)").execute(pool).await?;
+ session TEXT NOT NULL)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_pending_uploads_bucket ON pending_uploads(bucket_id)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_completed_uploads_bucket ON completed_uploads(bucket_id)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_bucket_key_c ON objects (bucket_id, key COLLATE \"C\")").execute(pool).await?;
     Ok(())
 }
 
@@ -2241,6 +2325,14 @@ async fn stream_object_response(
             .unwrap_or_else(|_| HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT")),
     );
 
+    if header_str(headers, "if-match")
+        .is_some_and(|value| !strong_etag_matches(value, &source.info.etag))
+    {
+        return Err(ApiError::new(
+            StatusCode::PRECONDITION_FAILED,
+            "Read precondition failed",
+        ));
+    }
     if header_str(headers, header::IF_NONE_MATCH.as_str())
         .map(|value| etag_matches(value, &source.info.etag))
         .unwrap_or(false)
@@ -2312,6 +2404,14 @@ fn object_response(
             .unwrap_or_else(|_| HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT")),
     );
 
+    if header_str(headers, "if-match")
+        .is_some_and(|value| !strong_etag_matches(value, &obj.info.etag))
+    {
+        return Err(ApiError::new(
+            StatusCode::PRECONDITION_FAILED,
+            "Read precondition failed",
+        ));
+    }
     if header_str(headers, header::IF_NONE_MATCH.as_str())
         .map(|value| etag_matches(value, &obj.info.etag))
         .unwrap_or(false)
@@ -2381,6 +2481,13 @@ fn object_head_response(info: ObjectInfo, headers: &HeaderMap) -> ApiResult<Resp
             .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
     );
 
+    if header_str(headers, "if-match").is_some_and(|value| !strong_etag_matches(value, &info.etag))
+    {
+        return Err(ApiError::new(
+            StatusCode::PRECONDITION_FAILED,
+            "Read precondition failed",
+        ));
+    }
     if header_str(headers, header::IF_NONE_MATCH.as_str())
         .map(|value| etag_matches(value, &info.etag))
         .unwrap_or(false)
@@ -2592,6 +2699,56 @@ fn parse_copy_source(value: &str) -> ApiResult<(String, String)> {
         .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "Invalid x-amz-copy-source"))?;
     validate_bucket(bucket)?;
     Ok((bucket.to_string(), normalize_key(key)?))
+}
+
+#[derive(Serialize, Deserialize)]
+struct ListCursor {
+    bucket: String,
+    prefix: String,
+    delimiter: String,
+    lower: String,
+    inclusive: bool,
+}
+impl ListCursor {
+    fn encode(&self) -> String {
+        format!(
+            "v1.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(self).expect("cursor serialization"))
+        )
+    }
+    fn decode(value: &str, bucket: &str, prefix: &str, delimiter: &str) -> ApiResult<Self> {
+        let invalid = || {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Invalid continuation token or listing context",
+            )
+        };
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(value.strip_prefix("v1.").ok_or_else(invalid)?)
+            .map_err(|_| invalid())?;
+        let cursor: Self = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if cursor.bucket != bucket
+            || cursor.prefix != prefix
+            || cursor.delimiter != delimiter
+            || cursor.lower.as_str() < prefix
+        {
+            return Err(invalid());
+        }
+        Ok(cursor)
+    }
+}
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    for (pos, ch) in prefix.char_indices().rev() {
+        let mut next = ch as u32 + 1;
+        if next == 0xd800 {
+            next = 0xe000;
+        }
+        if let Some(ch) = char::from_u32(next) {
+            return Some(format!("{}{}", &prefix[..pos], ch));
+        }
+    }
+    None
 }
 
 fn etag_matches(header_value: &str, current_etag: &str) -> bool {

@@ -475,7 +475,7 @@ await client.abort_multipart_upload(upload_id)
   服务端已有的 `max_upload_size` 若明确设为非零，则同时检查总大小；默认 0 表示不限。
   服务端合并采用固定缓冲区，客户端 `upload_part` 只需要提供当前分片的字节数据。
 - `abort_multipart_upload` 可取消未完成上传并删除分片，也可释放完成回执。
-  未完成会话不会自动过期，以免误删仍需续传的数据；调用方应保存 ID 并在放弃时取消。
+  未完成会话默认不会自动过期；可显式启用下述闲置清理。调用方应保存 ID 并在放弃时取消。
 - 这是 alocals3 的 JSON 分片协议，不是 AWS S3 的 XML multipart 协议：
   `POST /s3-multipart/<bucket>/<key>` 创建；`PUT /s3-uploads/<id>/<part_number>` 上传；
   `GET /s3-uploads/<id>` 查询；`POST /s3-uploads/<id>` 提交；`DELETE /s3-uploads/<id>` 取消。
@@ -486,3 +486,87 @@ await client.abort_multipart_upload(upload_id)
 PostgreSQL 数据库中的临时 schema，测试完成后删除，不使用业务表。
 
 `GET /healthz` 返回 `status`、`system`（默认 `alocals3`）及 `module: "alocals3"`。集成到其他平台时，可通过 `--health-system` 或 `ALOCALS3_HEALTH_SYSTEM` 设置所属系统的公开身份。这些字段用于识别，不是认证。
+
+
+## 0.10.0：并发、维护和可靠下载
+
+### 原子条件写入与分页
+
+普通 PUT 和分片完成支持 `If-Match` / `If-None-Match`，条件检查和对象发布在同一
+短数据库事务内完成。复制、删除和 GC 的缺失记录清理也参与 bucket 写入协调。
+文件上传及分片合并在事务外进行；支持共享同一数据库和存储目录的多个服务进程。
+写条件使用强 ETag 比较，弱 ETag（`W/`）不匹配；失败返回 `412`，不修改原对象。
+GET/HEAD 也支持 `If-Match`，用于固定下载的对象内容。
+
+```python
+await client.put_object_bytes("my-bucket", "manifest.json", b"{}", if_none_match="*")
+headers = await client.head_object("my-bucket", "manifest.json")
+await client.put_object_bytes("my-bucket", "manifest.json", b'{"done":true}', if_match=headers["etag"])
+await client.complete_multipart_upload(upload_id, parts, if_none_match="*")
+```
+
+同步客户端使用相同参数。已成功完成的 multipart 重试仍返回原回执，不会重新判断
+写条件或覆盖后续对象。
+
+ListObjectsV2 改为数据库范围分页，修复翻页漏对象，并正确跳过已返回的目录。
+`max-keys=0` 返回空页。continuation token 是不透明游标，与 bucket、prefix 和
+delimiter 绑定；调用方应原样传回。升级后须从第一页重新获取 token，旧版 token
+不能继续使用。翻页期间并发变更不提供跨页快照。
+
+### 分片管理与可选清理
+
+```python
+page = await client.list_multipart_uploads("my-bucket", limit=100)
+for upload in page["uploads"]:
+    print(upload["upload_id"], upload["key"], upload["size"], upload["part_count"], upload["last_activity"])
+# 翻页：传入 continuation_token=page["next_continuation_token"]
+result = await client.abort_multipart_uploads([upload["upload_id"] for upload in page["uploads"]])
+# result["results"] 包含每个 upload_id 的 status；单批最多 100 个。
+```
+
+HTTP：`GET /s3-uploads?bucket=<name>&limit=100&continuation_token=<token>`，
+`POST /s3-uploads/abort`，JSON body 为 `{"upload_ids":["..."]}`。
+两者均复用服务凭据鉴权。列表仅包含未完成会话；完成回执可按 ID 手动取消。
+列表包含已落库分片的字节数，不计尚在接收的临时文件。
+
+自动清理默认关闭。示例：每分钟检查，删除闲置超过七天的未完成上传。
+
+```bash
+alocals3-server --multipart-idle-secs 604800 --multipart-cleanup-interval-secs 60
+```
+
+对应环境变量是 `ALOCALS3_MULTIPART_IDLE_SECS`（默认 `0`）和
+`ALOCALS3_MULTIPART_CLEANUP_INTERVAL_SECS`（默认 `60`，最小按 `1` 执行）。
+开始和完成分片接收会刷新闲置时间；跨进程文件锁保护接收、等待上传名额及合并中的会话。
+升级前创建的旧会话在下一次上传分片前不参与自动过期。完成回执不会自动删除。
+
+### 只读完整性巡检
+
+```bash
+# 文件存在性及长度检查
+alocals3-server --database-url sqlite:///./alocals3.db --storage-root ./data --verify
+# 额外逐块校验 SHA-256 内容地址和 MD5 ETag
+alocals3-server --database-url sqlite:///./alocals3.db --storage-root ./data --verify-full
+```
+
+PostgreSQL 同样支持。命令仅连接现有数据库，不建库、不迁移、不启动 HTTP/GC，
+也不删除或修复记录。stdout 输出 JSON，包含 `checked_objects`、`full` 和 `issues`；
+每个问题包含 bucket、key、file_path 和 problem。正常退出码为 `0`，检测到问题为 `1`。
+在线巡检可能观察到并发覆盖/GC，稳定审计应在暂停写入后运行。
+
+### 下载续传与原子替换
+
+```python
+await client.get_object_to_file("my-bucket", "large.bin", Path("large.bin"), resume=True, max_retries=3)
+# 忽略已有半成品，重新下载：resume=False
+```
+
+同步接口参数相同。完整文件下载默认通过 HEAD 获取 ETag 和长度，使用 `If-Match`
+固定版本，断线后按 Range 续传；跨调用也可复用半成品。对象 ETag、长度或 URL 改变时
+从头下载。完成后校验长度及 MD5 ETag，再原子替换目标文件；失败保留原目标文件。
+显式 `range_header` 下载同样流式写入并在成功后替换，但不执行续传或完整对象摘要校验。
+
+半成品与状态位于目标旁的 `.alocals3.part`、`.alocals3.json` 后缀文件。
+`.alocals3.lock` 防止多个进程同时下载到同一目标；锁文件保留，OS 锁在结束时释放。
+取消或中断后可再次调用继续下载；校验失败可用 `resume=False` 重新开始。
+客户端与服务端需一并升级至 0.10.0。

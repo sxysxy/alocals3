@@ -1,6 +1,6 @@
 [package]
 name = "alocals3-rust"
-version = "0.9.5"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.89"
 authors = ["HfCloud(sxysxygm@gmail.com)"]
@@ -54,7 +54,7 @@ features = ["extension-module"]
 
 [features]
 default = []
-extension-module = ["dep:pyo3", "pyo3/extension-module", "dep:pyo3-async-runtimes"]
+extension-module = ["dep:pyo3", "pyo3/extension-module", "dep:pyo3-async-runtimes", "dep:serde", "dep:serde_json"]
 server = [
     "dep:anyhow",
     "dep:axum",

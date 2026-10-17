@@ -47,18 +47,26 @@ class ALocalS3Client:
         """Return ordered uploaded parts and any completed-upload receipt."""
         return _loads(self._client.list_parts_json(upload_id))
 
-    def complete_multipart_upload(self, upload_id: str, parts: list[dict]) -> dict:
+    def complete_multipart_upload(self, upload_id: str, parts: list[dict], *, if_match: str | None = None, if_none_match: str | None = None) -> dict:
         """Atomically publish all parts, consecutively numbered from 1.
 
         Pass the part_number and etag returned by upload_part/list_parts.
         Retrying the same completed manifest returns its original receipt.
         """
         manifest = json.dumps({"parts": [{"part_number": p["part_number"], "etag": p["etag"]} for p in parts]})
-        return _loads(self._client.complete_multipart_upload_json(upload_id, manifest))
+        return _loads(self._client.complete_multipart_upload_json(upload_id, manifest, if_match, if_none_match))
 
     def abort_multipart_upload(self, upload_id: str) -> None:
         """Remove pending data (or a completion receipt), leaving published objects intact."""
         self._client.abort_multipart_upload(upload_id)
+
+    def list_multipart_uploads(self, bucket: str, *, limit: int = 100, continuation_token: str | None = None) -> dict:
+        """List pending uploads, part counts and stored bytes in a bucket."""
+        return _loads(self._client.list_multipart_uploads_json(bucket, limit, continuation_token))
+
+    def abort_multipart_uploads(self, upload_ids: list[str]) -> dict:
+        """Cancel at most 100 uploads; returns an HTTP status per upload."""
+        return _loads(self._client.abort_multipart_uploads_json(json.dumps({"upload_ids": upload_ids})))
 
     def health(self) -> dict:
         return _loads(self._client.health_json())
@@ -92,8 +100,11 @@ class ALocalS3Client:
         file_path: Path,
         content_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        *,
+        if_match: str | None = None,
+        if_none_match: str | None = None,
     ) -> dict:
-        return _loads(self._client.put_object_json(bucket, key, str(file_path), content_type, metadata))
+        return _loads(self._client.put_object_json(bucket, key, str(file_path), content_type, metadata, if_match, if_none_match))
 
     def put_object_bytes(
         self,
@@ -102,8 +113,11 @@ class ALocalS3Client:
         body: bytes | bytearray | memoryview,
         content_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        *,
+        if_match: str | None = None,
+        if_none_match: str | None = None,
     ) -> dict:
-        return _loads(self._client.put_object_bytes_json(bucket, key, bytes(body), content_type, metadata))
+        return _loads(self._client.put_object_bytes_json(bucket, key, bytes(body), content_type, metadata, if_match, if_none_match))
 
     def get_object(self, bucket: str, key: str, output_path: Path) -> None:
         self._client.get_object_to_file(bucket, key, str(output_path), None)
@@ -122,8 +136,12 @@ class ALocalS3Client:
         key: str,
         output_path: Path,
         range_header: str | None = None,
+        *,
+        resume: bool = True,
+        max_retries: int = 3,
     ) -> dict:
-        return self._client.get_object_to_file(bucket, key, str(output_path), range_header)
+        """Stream to a partial file, resume the same ETag and replace on success."""
+        return self._client.get_object_to_file(bucket, key, str(output_path), range_header, resume, max_retries)
 
     def delete_object(self, bucket: str, key: str) -> None:
         self._client.delete_object(bucket, key)
@@ -240,18 +258,26 @@ class ALocalS3ClientAsync:
         """Return ordered uploaded parts and any completed-upload receipt."""
         return _loads(await self._client.list_parts_json(upload_id))
 
-    async def complete_multipart_upload(self, upload_id: str, parts: list[dict]) -> dict:
+    async def complete_multipart_upload(self, upload_id: str, parts: list[dict], *, if_match: str | None = None, if_none_match: str | None = None) -> dict:
         """Atomically publish all parts, consecutively numbered from 1.
 
         Pass the part_number and etag returned by upload_part/list_parts.
         Retrying the same completed manifest returns its original receipt.
         """
         manifest = json.dumps({"parts": [{"part_number": p["part_number"], "etag": p["etag"]} for p in parts]})
-        return _loads(await self._client.complete_multipart_upload_json(upload_id, manifest))
+        return _loads(await self._client.complete_multipart_upload_json(upload_id, manifest, if_match, if_none_match))
 
     async def abort_multipart_upload(self, upload_id: str) -> None:
         """Remove pending data (or a completion receipt), leaving published objects intact."""
         await self._client.abort_multipart_upload(upload_id)
+
+    async def list_multipart_uploads(self, bucket: str, *, limit: int = 100, continuation_token: str | None = None) -> dict:
+        """List pending uploads, part counts and stored bytes in a bucket."""
+        return _loads(await self._client.list_multipart_uploads_json(bucket, limit, continuation_token))
+
+    async def abort_multipart_uploads(self, upload_ids: list[str]) -> dict:
+        """Cancel at most 100 uploads; returns an HTTP status per upload."""
+        return _loads(await self._client.abort_multipart_uploads_json(json.dumps({"upload_ids": upload_ids})))
 
     async def health(self) -> dict:
         return _loads(await self._client.health_json())
@@ -289,8 +315,11 @@ class ALocalS3ClientAsync:
         file_path: Path,
         content_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        *,
+        if_match: str | None = None,
+        if_none_match: str | None = None,
     ) -> dict:
-        return _loads(await self._client.put_object_json(bucket, key, str(file_path), content_type, metadata))
+        return _loads(await self._client.put_object_json(bucket, key, str(file_path), content_type, metadata, if_match, if_none_match))
 
     async def put_object_bytes(
         self,
@@ -299,9 +328,12 @@ class ALocalS3ClientAsync:
         body: bytes | bytearray | memoryview,
         content_type: str | None = None,
         metadata: dict[str, str] | None = None,
+        *,
+        if_match: str | None = None,
+        if_none_match: str | None = None,
     ) -> dict:
         return _loads(
-            await self._client.put_object_bytes_json(bucket, key, bytes(body), content_type, metadata)
+            await self._client.put_object_bytes_json(bucket, key, bytes(body), content_type, metadata, if_match, if_none_match)
         )
 
     async def get_object(self, bucket: str, key: str, output_path: Path) -> None:
@@ -328,8 +360,12 @@ class ALocalS3ClientAsync:
         key: str,
         output_path: Path,
         range_header: str | None = None,
+        *,
+        resume: bool = True,
+        max_retries: int = 3,
     ) -> dict:
-        return await self._client.get_object_to_file(bucket, key, str(output_path), range_header)
+        """Stream to a partial file, resume the same ETag and replace on success."""
+        return await self._client.get_object_to_file(bucket, key, str(output_path), range_header, resume, max_retries)
 
     async def delete_object(self, bucket: str, key: str) -> None:
         await self._client.delete_object(bucket, key)

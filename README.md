@@ -498,7 +498,7 @@ different parts may upload concurrently. Sessions survive server restarts.
 There is no minimum part size, 16 MiB limit, or policy limit on part count;
 an explicitly configured server `max_upload_size` also applies to aggregate
 size (default 0: unlimited). Pending sessions are retained until explicitly
-aborted; persist upload IDs and abort abandoned uploads. An empty manifest can
+aborted unless optional idle cleanup is enabled; persist upload IDs and abort abandoned uploads. An empty manifest can
 publish an empty object. Both SQLite and PostgreSQL are supported; new tables
 are created on server startup. Filesystem locks coordinate servers sharing
 the same storage directory; building requires Rust 1.89+.
@@ -514,3 +514,81 @@ an isolated SQLite database by default. Set `ALOCALS3_TEST_POSTGRES_URL` to use
 an isolated temporary PostgreSQL schema instead (requires psycopg for tests).
 
 `GET /healthz` returns `status`, `system` (default `alocals3`) and `module: "alocals3"`. Embedding applications may set `--health-system` / `ALOCALS3_HEALTH_SYSTEM` to their public system identity. This is identification, not authentication.
+
+
+## 0.10.0: conditional writes, maintenance, and resumable downloads
+
+PUT and multipart completion now check `If-Match` / `If-None-Match` in the same
+short database transaction that publishes the object. Copy, deletion and GC
+metadata removal participate in bucket write coordination across server processes.
+Uploads and assembly happen outside SQL transactions. Failed conditions return
+412 without changing the object; write conditions use strong ETags. GET/HEAD also
+support `If-Match`. Completed multipart retries return their original receipt,
+including when a precondition would no longer match.
+
+```python
+await client.put_object_bytes("bucket", "manifest.json", b"{}", if_none_match="*")
+headers = await client.head_object("bucket", "manifest.json")
+await client.put_object_bytes("bucket", "manifest.json", b'{"done":true}', if_match=headers["etag"])
+await client.complete_multipart_upload(upload_id, parts, if_none_match="*")
+```
+
+ListObjectsV2 uses bounded SQL range queries and fixes skipped objects and repeated
+common prefixes across pages. `max-keys=0` returns an empty page. Tokens are opaque
+and bound to the bucket, prefix and delimiter. Restart listings after upgrading;
+old tokens are not accepted. Listings do not provide a snapshot across pages.
+
+List and cancel incomplete uploads with either client (remove `await` for sync):
+
+```python
+page = await client.list_multipart_uploads("bucket", limit=100)
+# Next page: continuation_token=page["next_continuation_token"]
+# Each upload includes upload_id, key, size, part_count and last_activity.
+result = await client.abort_multipart_uploads([u["upload_id"] for u in page["uploads"]])
+# result["results"] contains upload_id/status; at most 100 IDs per batch.
+```
+
+HTTP endpoints are `GET /s3-uploads?bucket=<name>&limit=100&continuation_token=<token>`
+and `POST /s3-uploads/abort` with `{"upload_ids":["..."]}`. Both require the service
+credential when authentication is enabled. Listings include only incomplete
+sessions and bytes from committed parts, excluding in-flight temporary data.
+Completed receipts can still be explicitly aborted by ID without deleting objects.
+
+Automatic cleanup is **disabled by default**. Opt in with
+`--multipart-idle-secs 604800 --multipart-cleanup-interval-secs 60` to expire idle
+incomplete sessions after seven days, checking once a minute. Environment variables:
+`ALOCALS3_MULTIPART_IDLE_SECS` (default 0) and
+`ALOCALS3_MULTIPART_CLEANUP_INTERVAL_SECS` (default 60, effective minimum 1).
+Part receive start and completion refresh activity; cross-process locks protect
+receivers, admission waits and assembly. Legacy sessions become eligible after
+their next part upload. Completed receipts are never automatically expired.
+
+Read-only inspection runs without starting HTTP or GC or applying migrations:
+
+```bash
+alocals3-server --database-url sqlite:///./alocals3.db --storage-root ./data --verify
+alocals3-server --database-url sqlite:///./alocals3.db --storage-root ./data --verify-full
+```
+
+Both SQLite and PostgreSQL are supported. Quick mode checks file existence and
+length; full mode also checks SHA-256 content addresses and MD5 ETags in bounded
+chunks. JSON stdout contains `checked_objects`, `full`, and `issues` with
+bucket/key/file_path/problem. Exit status is 0 when clean and 1 when issues exist.
+No records or files are repaired or removed. Pause writers for a stable audit;
+concurrent overwrites/GC can affect an online inspection.
+
+File downloads now stream into a sibling partial file, pin the HEAD ETag with
+`If-Match`, resume interrupted transfers using Range, validate length and MD5 ETag,
+and atomically replace the destination on success:
+
+```python
+await client.get_object_to_file("bucket", "large.bin", Path("large.bin"), resume=True, max_retries=3)
+```
+
+Sync clients accept the same options. A matching partial resumes across calls;
+changed URL, ETag or size triggers a restart. Errors preserve the previous output.
+Use `resume=False` to discard a partial, including after a checksum failure.
+Partial/state files use `.alocals3.part` and `.alocals3.json` suffixes next to the
+output; `.alocals3.lock` remains on disk to coordinate concurrent processes and its
+OS lock is released on exit. Explicit Range downloads stream and replace atomically
+but do not resume or validate the full-object digest. Upgrade client and server together.

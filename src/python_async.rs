@@ -1,6 +1,4 @@
-use super::{
-    bucket_path, encode_key, encode_segment, http_error, http_status_error, object_path,
-};
+use super::{bucket_path, encode_key, encode_segment, http_error, http_status_error, object_path};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes};
@@ -88,8 +86,9 @@ impl RustHttpClientAsync {
             });
         let mut default_headers = HeaderMap::new();
         if let Some(token) = resolved_service_token {
-            let value = HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|_| pyo3::exceptions::PyValueError::new_err("invalid alocals3 service token"))?;
+            let value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err("invalid alocals3 service token")
+            })?;
             default_headers.insert(AUTHORIZATION, value);
         }
 
@@ -124,7 +123,10 @@ impl RustHttpClientAsync {
         bucket: &str,
         key: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let request = self.inner.client.head(self.inner.url(&object_path(bucket, key)));
+        let request = self
+            .inner
+            .client
+            .head(self.inner.url(&object_path(bucket, key)));
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let response = checked_response(request).await?;
             Ok(headers_to_map(response.headers()))
@@ -132,30 +134,124 @@ impl RustHttpClientAsync {
     }
 
     #[pyo3(signature = (bucket, key, content_type=None, metadata=None))]
-    fn create_multipart_upload_json<'py>(&self, py: Python<'py>, bucket: &str, key: &str,
-        content_type: Option<&str>, metadata: Option<HashMap<String, String>>) -> PyResult<Bound<'py, PyAny>> {
-        let url = self.inner.url(&format!("/s3-multipart/{}/{}", encode_segment(bucket), encode_key(key)));
-        self.request_json(py, add_request_headers(self.inner.client.post(url), content_type, metadata))
+    fn create_multipart_upload_json<'py>(
+        &self,
+        py: Python<'py>,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+        metadata: Option<HashMap<String, String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let url = self.inner.url(&format!(
+            "/s3-multipart/{}/{}",
+            encode_segment(bucket),
+            encode_key(key)
+        ));
+        self.request_json(
+            py,
+            add_request_headers(self.inner.client.post(url), content_type, metadata),
+        )
     }
 
-    fn upload_part_json<'py>(&self, py: Python<'py>, upload_id: &str, part_number: u64, body: &[u8]) -> PyResult<Bound<'py, PyAny>> {
-        let url = self.inner.url(&format!("/s3-uploads/{}/{}", encode_segment(upload_id), part_number));
+    fn upload_part_json<'py>(
+        &self,
+        py: Python<'py>,
+        upload_id: &str,
+        part_number: u64,
+        body: &[u8],
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let url = self.inner.url(&format!(
+            "/s3-uploads/{}/{}",
+            encode_segment(upload_id),
+            part_number
+        ));
         self.request_json(py, self.inner.stream_client.put(url).body(body.to_vec()))
     }
 
-    fn list_parts_json<'py>(&self, py: Python<'py>, upload_id: &str) -> PyResult<Bound<'py, PyAny>> {
-        let url = self.inner.url(&format!("/s3-uploads/{}", encode_segment(upload_id)));
+    fn list_parts_json<'py>(
+        &self,
+        py: Python<'py>,
+        upload_id: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let url = self
+            .inner
+            .url(&format!("/s3-uploads/{}", encode_segment(upload_id)));
         self.request_json(py, self.inner.client.get(url))
     }
 
-    fn complete_multipart_upload_json<'py>(&self, py: Python<'py>, upload_id: &str, manifest: &str) -> PyResult<Bound<'py, PyAny>> {
-        let url = self.inner.url(&format!("/s3-uploads/{}", encode_segment(upload_id)));
-        self.request_json(py, self.inner.stream_client.post(url).header(CONTENT_TYPE, "application/json").body(manifest.to_string()))
+    #[pyo3(signature = (upload_id, manifest, if_match=None, if_none_match=None))]
+    fn complete_multipart_upload_json<'py>(
+        &self,
+        py: Python<'py>,
+        upload_id: &str,
+        manifest: &str,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let url = self
+            .inner
+            .url(&format!("/s3-uploads/{}", encode_segment(upload_id)));
+        let mut request = self
+            .inner
+            .stream_client
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .body(manifest.to_string());
+        if let Some(value) = if_match {
+            request = request.header("if-match", value);
+        }
+        if let Some(value) = if_none_match {
+            request = request.header("if-none-match", value);
+        }
+        self.request_json(py, request)
     }
 
-    fn abort_multipart_upload<'py>(&self, py: Python<'py>, upload_id: &str) -> PyResult<Bound<'py, PyAny>> {
-        let url = self.inner.url(&format!("/s3-uploads/{}", encode_segment(upload_id)));
+    fn abort_multipart_upload<'py>(
+        &self,
+        py: Python<'py>,
+        upload_id: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let url = self
+            .inner
+            .url(&format!("/s3-uploads/{}", encode_segment(upload_id)));
         self.request_empty(py, self.inner.client.delete(url))
+    }
+
+    #[pyo3(signature = (bucket, limit=100, continuation_token=None))]
+    fn list_multipart_uploads_json<'py>(
+        &self,
+        py: Python<'py>,
+        bucket: &str,
+        limit: i64,
+        continuation_token: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = self
+            .inner
+            .client
+            .get(self.inner.url("/s3-uploads"))
+            .query(&[
+                ("bucket", bucket.to_string()),
+                ("limit", limit.to_string()),
+                (
+                    "continuation_token",
+                    continuation_token.unwrap_or("").to_string(),
+                ),
+            ]);
+        self.request_json(py, request)
+    }
+    fn abort_multipart_uploads_json<'py>(
+        &self,
+        py: Python<'py>,
+        manifest: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.request_json(
+            py,
+            self.inner
+                .client
+                .post(self.inner.url("/s3-uploads/abort"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(manifest.to_owned()),
+        )
     }
 
     fn health_json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -177,14 +273,12 @@ impl RustHttpClientAsync {
         )
     }
 
-    fn delete_bucket<'py>(
-        &self,
-        py: Python<'py>,
-        bucket: &str,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn delete_bucket<'py>(&self, py: Python<'py>, bucket: &str) -> PyResult<Bound<'py, PyAny>> {
         self.request_empty(
             py,
-            self.inner.client.delete(self.inner.url(&bucket_path(bucket))),
+            self.inner
+                .client
+                .delete(self.inner.url(&bucket_path(bucket))),
         )
     }
 
@@ -235,7 +329,7 @@ impl RustHttpClientAsync {
         self.request_json(py, request)
     }
 
-    #[pyo3(signature = (bucket, key, file_path, content_type=None, metadata=None))]
+    #[pyo3(signature = (bucket, key, file_path, content_type=None, metadata=None, if_match=None, if_none_match=None))]
     fn put_object_json<'py>(
         &self,
         py: Python<'py>,
@@ -244,13 +338,19 @@ impl RustHttpClientAsync {
         file_path: &str,
         content_type: Option<&str>,
         metadata: Option<HashMap<String, String>>,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let url = inner.url(&object_path(bucket, key));
         let file_path = PathBuf::from(file_path);
         let content_type = content_type.map(str::to_string);
+        let if_match = if_match.map(str::to_owned);
+        let if_none_match = if_none_match.map(str::to_owned);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let file = tokio::fs::File::open(&file_path).await.map_err(super::io_error)?;
+            let file = tokio::fs::File::open(&file_path)
+                .await
+                .map_err(super::io_error)?;
             let len = file.metadata().await.map_err(super::io_error)?.len();
             let stream = ReaderStream::new(BufReader::new(file));
             let mut request = inner
@@ -258,12 +358,18 @@ impl RustHttpClientAsync {
                 .put(url)
                 .header(CONTENT_LENGTH, len)
                 .body(reqwest::Body::wrap_stream(stream));
+            if let Some(value) = if_match {
+                request = request.header("if-match", value);
+            }
+            if let Some(value) = if_none_match {
+                request = request.header("if-none-match", value);
+            }
             request = add_request_headers(request, content_type.as_deref(), metadata);
             request_json(request).await
         })
     }
 
-    #[pyo3(signature = (bucket, key, body, content_type=None, metadata=None))]
+    #[pyo3(signature = (bucket, key, body, content_type=None, metadata=None, if_match=None, if_none_match=None))]
     fn put_object_bytes_json<'py>(
         &self,
         py: Python<'py>,
@@ -272,14 +378,29 @@ impl RustHttpClientAsync {
         body: &[u8],
         content_type: Option<&str>,
         metadata: Option<HashMap<String, String>>,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let url = inner.url(&object_path(bucket, key));
         let body = body.to_vec();
         let content_type = content_type.map(str::to_string);
+        let if_match = if_match.map(str::to_owned);
+        let if_none_match = if_none_match.map(str::to_owned);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let request = inner.client.put(url).body(body);
-            request_json(add_request_headers(request, content_type.as_deref(), metadata)).await
+            let mut request = inner.client.put(url).body(body);
+            if let Some(value) = if_match {
+                request = request.header("if-match", value);
+            }
+            if let Some(value) = if_none_match {
+                request = request.header("if-none-match", value);
+            }
+            request_json(add_request_headers(
+                request,
+                content_type.as_deref(),
+                metadata,
+            ))
+            .await
         })
     }
 
@@ -302,13 +423,11 @@ impl RustHttpClientAsync {
             let response = checked_response(request).await?;
             let headers = headers_to_map(response.headers());
             let body = response.bytes().await.map_err(http_error)?;
-            Python::attach(|py| {
-                Ok((PyBytes::new(py, &body).unbind(), headers))
-            })
+            Python::attach(|py| Ok((PyBytes::new(py, &body).unbind(), headers)))
         })
     }
 
-    #[pyo3(signature = (bucket, key, output_path, range_header=None))]
+    #[pyo3(signature = (bucket, key, output_path, range_header=None, resume=true, max_retries=3))]
     fn get_object_to_file<'py>(
         &self,
         py: Python<'py>,
@@ -316,27 +435,24 @@ impl RustHttpClientAsync {
         key: &str,
         output_path: &str,
         range_header: Option<&str>,
+        resume: bool,
+        max_retries: u32,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        let url = inner.url(&object_path(bucket, key));
-        let output_path = PathBuf::from(output_path);
-        let range_header = range_header.map(str::to_string);
+        let client = self.inner.stream_client.clone();
+        let url = self.inner.url(&object_path(bucket, key));
+        let output = PathBuf::from(output_path);
+        let range = range_header.map(str::to_owned);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut request = inner.stream_client.get(url);
-            if let Some(range_header) = range_header {
-                request = request.header(RANGE, range_header);
-            }
-            let mut response = checked_response(request).await?;
-            let headers = headers_to_map(response.headers());
-            if let Some(parent) = output_path.parent() {
-                tokio::fs::create_dir_all(parent).await.map_err(super::io_error)?;
-            }
-            let mut file = tokio::fs::File::create(output_path).await.map_err(super::io_error)?;
-            while let Some(chunk) = response.chunk().await.map_err(http_error)? {
-                file.write_all(&chunk).await.map_err(super::io_error)?;
-            }
-            file.flush().await.map_err(super::io_error)?;
-            Ok(headers)
+            let headers = match range {
+                Some(range) => {
+                    super::download::asynchronous_range(&client, &url, &output, &range).await?
+                }
+                None => {
+                    super::download::asynchronous(&client, &url, &output, resume, max_retries)
+                        .await?
+                }
+            };
+            Ok(headers_to_map(&headers))
         })
     }
 
@@ -382,7 +498,10 @@ impl RustHttpClientAsync {
         let request = self
             .inner
             .client
-            .put(self.inner.url(&object_path(destination_bucket, destination_key)))
+            .put(
+                self.inner
+                    .url(&object_path(destination_bucket, destination_key)),
+            )
             .query(&[("output", "json")])
             .header("x-amz-copy-source", source)
             .header("x-amz-metadata-directive", directive);

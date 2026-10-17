@@ -1,3 +1,12 @@
+# Version 0.11.0
+
+- Add object bulk deletion with one bucket transaction and set-based SQL per 1000-key batch; clients automatically batch iterables and support quiet responses and per-object ETag conditions.
+- Persist bucket/prefix expiration rules with enabled flags, paginated previews (including disabled-rule previews), and bounded background expiration sweeps coordinated with concurrent writers.
+- Maintain object counts and logical byte usage transactionally with SQLite/PostgreSQL triggers; enforce persistent bucket quotas for PUT, overwrite, copy and multipart completion.
+- Protect disk free-space reserves while receiving uploads/parts and assembling multipart objects; coordinate writes across server processes and return 507 on insufficient capacity.
+- Add authenticated storage/bucket usage APIs and Prometheus metrics, public readiness probes, bounded route labels, streaming byte counters and request IDs.
+- Add SQLite/PostgreSQL maintenance regressions; retain GC grace periods for bulk/lifecycle reclamation.
+
 # Version 0.10.0
 
 - Fix ListObjectsV2 continuation boundaries and delimiter paging; use bounded SQL range queries with deterministic UTF-8 ordering and context-bound opaque cursors.

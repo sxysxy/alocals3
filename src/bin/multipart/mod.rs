@@ -311,7 +311,14 @@ pub(super) async fn upload_part(
         .objects_root()
         .with_file_name("multipart-staging")
         .join(&id);
-    let mut staged = stage_upload(&staging, body, state.max_upload_size, md5).await?;
+    let mut staged = stage_upload_with_capacity(
+        &staging,
+        body,
+        state.max_upload_size,
+        md5,
+        Some(&state.capacity),
+    )
+    .await?;
     let _lock = lock(&dir).await?;
     let session = read_session(&state.storage, &id, false).await?;
     active(&session)?;
@@ -341,7 +348,13 @@ pub(super) async fn upload_part(
     ))
 }
 
-async fn assemble(dir: &Path, session: &Session, max_size: usize) -> ApiResult<StagedUpload> {
+async fn assemble(
+    dir: &Path,
+    session: &Session,
+    max_size: usize,
+    capacity: &capacity::Capacity,
+) -> ApiResult<StagedUpload> {
+    capacity.check(0)?;
     let path = dir.join(format!(".complete-{}.tmp", Uuid::new_v4().simple()));
     let guard = TempFileGuard::new(path.clone());
     let mut output = tokio::fs::File::create(&path).await?;
@@ -371,7 +384,7 @@ async fn assemble(dir: &Path, session: &Session, max_size: usize) -> ApiResult<S
             part_md5.consume(&buffer[..n]);
             md5.consume(&buffer[..n]);
             sha256.update(&buffer[..n]);
-            output.write_all(&buffer[..n]).await?;
+            capacity.write(&mut output, &buffer[..n]).await?;
         }
         if size != part.size || format!("{:x}", part_md5.compute()) != part.etag {
             return Err(ApiError::new(
@@ -426,7 +439,7 @@ pub(super) async fn complete(
         clean_part_files(&dir).await;
         return Ok(Json(result.clone()));
     }
-    let staged = assemble(&dir, &session, state.max_upload_size).await?;
+    let staged = assemble(&dir, &session, state.max_upload_size, &state.capacity).await?;
     let (result, retired) = publish(
         &state.storage,
         &mut session,

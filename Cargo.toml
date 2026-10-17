@@ -1,6 +1,6 @@
 [package]
 name = "alocals3-rust"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 rust-version = "1.89"
 authors = ["HfCloud(sxysxygm@gmail.com)"]
@@ -26,6 +26,7 @@ base64 = { version = "0.22", optional = true }
 bytes = { version = "1", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive", "env"], optional = true }
+fs2 = { version = "0.4", optional = true }
 futures-util = { version = "0.3", optional = true }
 http = { version = "1", optional = true }
 hmac = { version = "0.12", optional = true }
@@ -62,6 +63,7 @@ server = [
     "dep:bytes",
     "dep:clap",
     "dep:futures-util",
+    "dep:fs2",
     "dep:http",
     "dep:hmac",
     "dep:serde",

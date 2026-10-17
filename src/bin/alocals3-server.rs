@@ -76,7 +76,11 @@ fn strong_etag_matches(value: &str, etag: &str) -> bool {
         .any(|v| v == "*" || (!v.starts_with("W/") && v.trim_matches('"') == etag))
 }
 
+mod capacity;
+mod lifecycle;
+mod monitor;
 mod multipart;
+mod operations;
 mod verify;
 
 use axum::body::Body;
@@ -135,6 +139,14 @@ fn version_info() -> &'static str {
 struct Args {
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
+    /// Preserve this many free bytes during upload reception and part assembly (0 disables).
+    #[arg(long, env = "ALOCALS3_MIN_FREE_BYTES", default_value_t = 268435456)]
+    min_free_bytes: u64,
+    /// Object-expiration sweep interval; 0 pauses automatic expiration.
+    #[arg(long, env = "ALOCALS3_LIFECYCLE_INTERVAL_SECS", default_value_t = 60)]
+    lifecycle_interval_secs: u64,
+    #[arg(long, env = "ALOCALS3_METRICS_INTERVAL_SECS", default_value_t = 15)]
+    metrics_interval_secs: u64,
     /// Inspect stored objects and exit (JSON report, exit 1 on corruption).
     #[arg(long)]
     verify: bool,
@@ -208,6 +220,8 @@ struct AppState {
     auth: Arc<AuthConfig>,
     max_upload_size: usize,
     upload_semaphore: Arc<Semaphore>,
+    capacity: Arc<capacity::Capacity>,
+    monitor: Arc<monitor::Monitor>,
 }
 
 struct AuthConfig {
@@ -453,6 +467,20 @@ impl GarbageCollector {
         });
     }
 
+    fn reclaim_paths(self: &Arc<Self>, paths: Vec<String>) {
+        let gc = self.clone();
+        tokio::spawn(async move {
+            if !gc.grace.is_zero() {
+                tokio::time::sleep(gc.grace).await;
+            }
+            for path in paths {
+                if let Err(e) = gc.storage.reclaim_unreferenced_path(&path).await {
+                    tracing::warn!(error = %e.detail, "bulk blob reclaim failed");
+                }
+            }
+        });
+    }
+
     async fn run_once(&self, reason: &'static str) {
         if self.running.swap(true, Ordering::AcqRel) {
             tracing::debug!(reason, "gc skipped because another run is active");
@@ -675,7 +703,7 @@ async fn request_authorization(
         return next.run(request).await;
     }
     let path = request.uri().path();
-    if path.starts_with("/s3") {
+    if path.starts_with("/s3") || path == "/metrics" {
         if !state.auth.service_token.is_empty()
             && !bearer_token(request.headers())
                 .map(|value| constant_time_equal(value, &state.auth.service_token))
@@ -757,7 +785,13 @@ async fn main() -> anyhow::Result<()> {
             Duration::from_secs(args.gc_start_delay_secs),
         ))
     };
+    let capacity = Arc::new(capacity::Capacity::new(
+        storage.objects_root().parent().unwrap().to_owned(),
+        args.min_free_bytes,
+    ));
     let state = AppState {
+        capacity,
+        monitor: Arc::new(monitor::Monitor::default()),
         health_system: args.health_system,
         storage,
         gc,
@@ -770,8 +804,39 @@ async fn main() -> anyhow::Result<()> {
         max_upload_size: args.max_upload_size,
         upload_semaphore: Arc::new(Semaphore::new(args.max_concurrent_uploads.max(1))),
     };
+    if args.lifecycle_interval_secs > 0 {
+        lifecycle::start(
+            state.clone(),
+            Duration::from_secs(args.lifecycle_interval_secs),
+        );
+    }
+    monitor::start(
+        state.clone(),
+        Duration::from_secs(args.metrics_interval_secs.max(1)),
+    );
     let app = Router::new()
         .route("/healthz", get(health))
+        .route("/readyz", get(monitor::ready))
+        .route("/metrics", get(monitor::metrics))
+        .route("/s3-admin/stats", get(monitor::stats))
+        .route(
+            "/s3-admin/:bucket/usage",
+            get(operations::bucket_usage).put(operations::set_quota),
+        )
+        .route(
+            "/s3-admin/:bucket/delete",
+            axum::routing::post(operations::delete_many),
+        )
+        .route(
+            "/s3-admin/:bucket/lifecycle",
+            get(lifecycle::get)
+                .put(lifecycle::put)
+                .delete(lifecycle::clear),
+        )
+        .route(
+            "/s3-admin/:bucket/lifecycle/preview",
+            axum::routing::post(lifecycle::preview),
+        )
         .route("/s3", get(list_buckets))
         .route(
             "/s3-multipart/:bucket/*key",
@@ -813,6 +878,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .layer(from_fn_with_state(state.clone(), request_authorization))
         .layer(from_fn(request_logging))
+        .layer(from_fn_with_state(state.clone(), monitor::middleware))
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
@@ -993,11 +1059,12 @@ async fn put_object(
             "Upload service unavailable",
         )
     })?;
-    let staged = stage_upload(
+    let staged = stage_upload_with_capacity(
         &state.storage.objects_root(),
         body,
         state.max_upload_size,
         expected_md5,
+        Some(&state.capacity),
     )
     .await?;
     let (info, created, retired_path) = state
@@ -1308,22 +1375,30 @@ impl Storage {
                 .connect_with(options)
                 .await?;
             init_sqlite(&pool).await?;
-            return Ok(Self::Sqlite {
+            let storage = Self::Sqlite {
                 pool,
                 objects_root,
                 gc_state,
-            });
+            };
+            operations::init(&storage)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.detail))?;
+            return Ok(storage);
         }
         let pool = PgPoolOptions::new()
             .max_connections(32)
             .connect(database_url)
             .await?;
         init_pg(&pool).await?;
-        Ok(Self::Postgres {
+        let storage = Self::Postgres {
             pool,
             objects_root,
             gc_state,
-        })
+        };
+        operations::init(&storage)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.detail))?;
+        Ok(storage)
     }
 
     async fn list_buckets(&self) -> ApiResult<Vec<BucketInfo>> {
@@ -2812,12 +2887,26 @@ fn range_error(total_size: usize) -> ApiError {
     )
 }
 
+#[cfg(test)]
 async fn stage_upload(
     objects_root: &Path,
     body: Body,
     max_upload_size: usize,
     expected_md5: Option<[u8; 16]>,
 ) -> ApiResult<StagedUpload> {
+    stage_upload_with_capacity(objects_root, body, max_upload_size, expected_md5, None).await
+}
+
+async fn stage_upload_with_capacity(
+    objects_root: &Path,
+    body: Body,
+    max_upload_size: usize,
+    expected_md5: Option<[u8; 16]>,
+    capacity: Option<&capacity::Capacity>,
+) -> ApiResult<StagedUpload> {
+    if let Some(c) = capacity {
+        c.check(0)?;
+    }
     tokio::fs::create_dir_all(objects_root).await?;
     let temp_path = objects_root.join(format!(".upload-{}.tmp", Uuid::new_v4().simple()));
     let guard = TempFileGuard::new(temp_path.clone());
@@ -2845,7 +2934,10 @@ async fn stage_upload(
         }
         md5_context.consume(&chunk);
         sha256.update(&chunk);
-        file.write_all(&chunk).await?;
+        match capacity {
+            Some(c) => c.write(&mut file, &chunk).await?,
+            None => file.write_all(&chunk).await?,
+        }
     }
 
     file.sync_all().await?;
@@ -2996,7 +3088,11 @@ fn escape_xml(value: &str) -> String {
 impl From<sqlx::Error> for ApiError {
     fn from(err: sqlx::Error) -> Self {
         ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            if err.to_string().contains("BucketQuotaExceeded") {
+                StatusCode::INSUFFICIENT_STORAGE
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
             format!("Database error: {err}"),
         )
     }
@@ -3005,7 +3101,11 @@ impl From<sqlx::Error> for ApiError {
 impl From<std::io::Error> for ApiError {
     fn from(err: std::io::Error) -> Self {
         ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            if err.kind() == std::io::ErrorKind::StorageFull {
+                StatusCode::INSUFFICIENT_STORAGE
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
             format!("I/O error: {err}"),
         )
     }

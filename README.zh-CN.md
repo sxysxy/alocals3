@@ -570,3 +570,117 @@ await client.get_object_to_file("my-bucket", "large.bin", Path("large.bin"), res
 `.alocals3.lock` 防止多个进程同时下载到同一目标；锁文件保留，OS 锁在结束时释放。
 取消或中断后可再次调用继续下载；校验失败可用 `resume=False` 重新开始。
 客户端与服务端需一并升级至 0.10.0。
+
+## 0.11.0：批量删除、对象过期、容量保护与监控
+
+### 高效批量删除
+
+```python
+# 同步客户端去掉 await；objects 也可以是生成器。
+result = await client.delete_objects("my-bucket", keys, quiet=True)
+print(result["deleted_count"], result["errors"])
+# 可按 ETag 防止删除已被别人更新的内容：
+result = await client.delete_objects("my-bucket", [
+    {"key": "tmp/result.bin", "if_match": expected_etag},
+    "tmp/another.bin",
+])
+```
+
+客户端自动按每批 1000 项发送请求。每批使用一次 bucket 写事务、集合查询和集合删除，
+不会逐对象发 HTTP 或逐对象提交事务。`POST /s3-admin/{bucket}/delete` 的 JSON 为
+`{"objects":["key", {"key":"another","if_match":"etag"}],"quiet":true}`。
+这是 alocals3 的 JSON 协议。
+
+返回 `deleted`、`errors`、`deleted_count` 和 `success_count`。缺失 key 按幂等删除成功
+处理；`deleted_count` 只统计实际删除的行，`success_count` 包含已不存在的 key。
+非 quiet 模式的 `deleted` 包含 key 和 existed；错误包含 key、status、error。
+无效 key 和条件不匹配不会阻止同批其他有效条目。数据库错误会回滚整批。
+客户端跨多批执行时，已经成功的批次不会因后续网络或数据库错误而回滚。
+
+对象元数据删除后立即不可见，blob 清理由后台处理，保留已有 GC grace period 并检查
+其他 key 的共享引用。`--disable-gc` 也会关闭批量删除和过期删除后的物理回收。
+
+### 持久化对象过期规则
+
+规则按 bucket 保存，prefix 为原样文本前缀，`%` 和 `_` 不作为通配符。
+对象从最后一次发布/覆盖的 `updated_at` 起计算保留时间；读取不会续期。
+复制到目标 key 和 multipart 完成会重新开始计时。规则也作用于配置前已有的对象。
+重叠规则中只要有一个已启用规则满足过期条件，对象即可被删除。
+
+```python
+rules = [{"id": "temporary-results", "prefix": "tmp/", "expire_after_secs": 7 * 86400, "enabled": False}]
+await client.set_lifecycle("my-bucket", rules)
+# 先查看停用规则将影响哪些对象，不修改任何内容。
+page = await client.preview_expiration("my-bucket", include_disabled=True, limit=100)
+# 后续页：after_id=page["next_after_id"]，保留 include_disabled=True。
+print(page["objects"])
+rules[0]["enabled"] = True
+await client.set_lifecycle("my-bucket", rules)
+# 暂停可将 enabled 改回 False；清除所有规则：
+# await client.clear_lifecycle("my-bucket")
+```
+
+`get_lifecycle` 查看规则，`set_lifecycle` 替换整个配置。每个 bucket 最多 100 条规则，
+ID 非空且唯一，保留时间为 1 秒至 100 年。省略 enabled 时为 true，空 prefix 匹配整个
+bucket。预览默认只查看已启用规则，`include_disabled=True` 可检查停用规则。
+
+HTTP 为 `GET|PUT|DELETE /s3-admin/{bucket}/lifecycle`；PUT body 为 `{"rules":[...]}`。
+预览：`POST /s3-admin/{bucket}/lifecycle/preview?limit=100&after_id=0&include_disabled=true`。
+分页返回 `objects`、`is_truncated`、`next_after_id`；预览不提供跨页快照。
+
+后台默认每 60 秒检查，`--lifecycle-interval-secs` / `ALOCALS3_LIFECYCLE_INTERVAL_SECS`
+设为 0 可暂停自动过期，仍可预览和配置。未配置规则时不会过期任何对象。
+每轮每 bucket 最多删除 10000 个对象，分批提交，后续轮次继续处理积压。
+过期是异步删除：对象在实际清理前仍可读取。检查与删除使用同一 bucket 写事务，
+不会根据旧扫描结果误删刚覆盖的新对象。停用规则不会恢复已经删除的对象。
+
+### 逻辑配额与磁盘余量
+
+```python
+await client.set_bucket_quota("my-bucket", 10 * 1024**3)
+print(await client.bucket_usage("my-bucket"))
+print(await client.storage_stats())
+# 关闭 bucket 配额：await client.set_bucket_quota("my-bucket", 0)
+```
+
+Bucket usage 返回 `object_count`、`logical_bytes`、`max_bytes`、`pending_part_bytes`。
+配额默认 0（不限），按已发布 key 的逻辑大小计费：共享同一 blob 的多个 key 分别计数。
+分片上传前的数据不占已发布逻辑配额，其磁盘占用受余量保护控制。
+PUT、覆盖、CopyObject 和分片完成都执行配额检查，超限返回 `507` 并回滚对象和计数。
+计数通过数据库触发器维护，覆盖、单删、批删、过期和缺失记录 GC 都会同步更新，
+不在每次写入时扫描整个 bucket。降低配额到现有用量以下后仍允许缩小对象或删除。
+
+HTTP：`GET|PUT /s3-admin/{bucket}/usage`，PUT body 为 `{"max_bytes":10737418240}`；
+全局统计为 `GET /s3-admin/stats`。全局统计还包含 pending_uploads、pending_part_bytes、
+filesystem_available_bytes、filesystem_total_bytes、min_free_bytes 和采样时间。
+文件系统容量指整个所在文件系统，包含其他程序的数据；不是本服务目录的独占占用。
+已删除但未 GC 的 blob 和临时文件仍占物理磁盘空间。
+
+磁盘保护默认预留 **256 MiB**，用 `--min-free-bytes` / `ALOCALS3_MIN_FREE_BYTES` 调整，
+0 为关闭。普通上传、分片接收和合并均逐块检查可用空间并协调写盘，空间不足返回 507，
+不发布半成品。分片合并需要额外临时空间；失败会保留可重试的分片。
+同目录的多个服务进程应使用一致的余量配置。此保护不能阻止其他程序占用同一磁盘。
+
+首次升级会增加 usage/lifecycle 表、索引和触发器，并从已有对象初始化容量计数；
+首次初始化需要读取已有元数据，PostgreSQL 安装触发器期间会短暂阻塞对象写入。
+
+### 监控接口
+
+- `GET /metrics`：Prometheus 文本，开启鉴权时需要服务 Bearer Token。
+- `GET /s3-admin/stats` 和 bucket usage：开启鉴权时同样需要服务凭据。
+- `GET /readyz`：公开就绪探针，检查数据库连接与磁盘余量，不就绪返回 503。
+- `GET /healthz`：保留原有公开存活与身份信息，低磁盘空间时仍可存活并处理读/删。
+
+同步/异步客户端提供 `metrics()`、`storage_stats()`、`bucket_usage()` 和 `ready()`。
+每个 HTTP 响应包含 `x-request-id`。Prometheus 指标包括：
+
+- 请求次数和响应头耗时直方图，标签仅使用 method、匹配路由模板和状态码。
+- 实际流过的请求/响应 body 字节数、等待响应头的请求数。
+- 批量删除数、过期删除数、过期任务失败数和统计采样失败数。
+- 对象数、逻辑字节数、未完成分片占用、文件系统容量与余量、采样时间。
+
+指标不使用对象 key 或用户令牌作标签。耗时统计截至响应头就绪，不代表完整大文件
+下载耗时；字节数随流式传输更新。存储 gauges 默认每 15 秒采样，可通过
+`--metrics-interval-secs` / `ALOCALS3_METRICS_INTERVAL_SECS` 调整（最小 1 秒）。
+`storage_stats()` 获取即时统计并刷新缓存。请求指标属于当前进程，重启会清零；
+多进程共享的存储 gauges 不应在监控端简单求和。

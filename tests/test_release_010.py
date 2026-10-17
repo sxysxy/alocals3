@@ -47,7 +47,8 @@ class ReleaseTests(unittest.IsolatedAsyncioTestCase):
             port = sock.getsockname()[1]
         log = open(self.root / 'server.log', 'ab')
         process = await asyncio.create_subprocess_exec(str(SERVER), '--port', str(port),
-            '--database-url', self.dsn, '--storage-root', str(self.root / 'data'), '--disable-gc',
+            '--database-url', self.dsn, '--storage-root', str(self.root / 'data'),
+            *(() if getattr(self, 'enable_gc', False) else ('--disable-gc',)),
             *extra, stdout=log, stderr=log)
         self.processes.append((process, log))
         client = ALocalS3ClientAsync(f'http://127.0.0.1:{port}', disable_proxy=True)

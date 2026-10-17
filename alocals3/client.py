@@ -4,11 +4,12 @@ import argparse
 import asyncio
 import codecs
 import io
+import itertools
 import json
 import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, quote
 
 from alocals3._alocals3_native import RustHttpClient, RustHttpClientAsync
 
@@ -67,6 +68,57 @@ class ALocalS3Client:
     def abort_multipart_uploads(self, upload_ids: list[str]) -> dict:
         """Cancel at most 100 uploads; returns an HTTP status per upload."""
         return _loads(self._client.abort_multipart_uploads_json(json.dumps({"upload_ids": upload_ids})))
+
+    def delete_objects(self, bucket: str, objects, *, quiet: bool = False) -> dict:
+        """Delete an iterable of keys or {key, if_match} entries, 1000 per HTTP batch.
+
+        Missing keys succeed; failed conditions and invalid keys are returned in
+        errors. quiet=True omits per-key successes, retaining counts and errors.
+        """
+        if isinstance(objects, (str, bytes, bytearray, dict)):
+            raise TypeError("objects must be an iterable of keys or conditional entries")
+        path = "/s3-admin/" + quote(bucket, safe="") + "/delete"
+        result = {"deleted": [], "errors": [], "deleted_count": 0, "success_count": 0}
+        iterator = iter(objects)
+        while batch := list(itertools.islice(iterator, 1000)):
+            page = _loads(self._client.maintenance_json("POST", path, json.dumps({"objects": batch, "quiet": quiet})))
+            for field in ("deleted", "errors"):
+                result[field].extend(page[field])
+            for field in ("deleted_count", "success_count"):
+                result[field] += page[field]
+        return result
+
+    def get_lifecycle(self, bucket: str) -> dict:
+        return _loads(self._client.maintenance_json("GET", "/s3-admin/" + quote(bucket, safe="") + "/lifecycle"))
+
+    def set_lifecycle(self, bucket: str, rules: list[dict]) -> dict:
+        """Replace expiration rules. Disabled rules are retained for later reuse."""
+        return _loads(self._client.maintenance_json("PUT", "/s3-admin/" + quote(bucket, safe="") + "/lifecycle", json.dumps({"rules": rules})))
+
+    def clear_lifecycle(self, bucket: str) -> dict:
+        return _loads(self._client.maintenance_json("DELETE", "/s3-admin/" + quote(bucket, safe="") + "/lifecycle"))
+
+    def preview_expiration(self, bucket: str, *, limit: int = 100, after_id: int = 0, include_disabled: bool = False) -> dict:
+        """Preview eligible objects without deletion; page using next_after_id."""
+        path = "/s3-admin/" + quote(bucket, safe="") + f"/lifecycle/preview?limit={limit}&after_id={after_id}&include_disabled={str(include_disabled).lower()}"
+        return _loads(self._client.maintenance_json("POST", path))
+
+    def bucket_usage(self, bucket: str) -> dict:
+        return _loads(self._client.maintenance_json("GET", "/s3-admin/" + quote(bucket, safe="") + "/usage"))
+
+    def set_bucket_quota(self, bucket: str, max_bytes: int) -> dict:
+        """Limit published logical bytes; 0 disables the quota."""
+        return _loads(self._client.maintenance_json("PUT", "/s3-admin/" + quote(bucket, safe="") + "/usage", json.dumps({"max_bytes": max_bytes})))
+
+    def storage_stats(self) -> dict:
+        return _loads(self._client.maintenance_json("GET", "/s3-admin/stats"))
+
+    def metrics(self) -> str:
+        """Return Prometheus text; storage gauges are periodically sampled."""
+        return self._client.maintenance_json("GET", "/metrics")
+
+    def ready(self) -> dict:
+        return _loads(self._client.maintenance_json("GET", "/readyz"))
 
     def health(self) -> dict:
         return _loads(self._client.health_json())
@@ -278,6 +330,57 @@ class ALocalS3ClientAsync:
     async def abort_multipart_uploads(self, upload_ids: list[str]) -> dict:
         """Cancel at most 100 uploads; returns an HTTP status per upload."""
         return _loads(await self._client.abort_multipart_uploads_json(json.dumps({"upload_ids": upload_ids})))
+
+    async def delete_objects(self, bucket: str, objects, *, quiet: bool = False) -> dict:
+        """Delete an iterable of keys or {key, if_match} entries, 1000 per HTTP batch.
+
+        Missing keys succeed; failed conditions and invalid keys are returned in
+        errors. quiet=True omits per-key successes, retaining counts and errors.
+        """
+        if isinstance(objects, (str, bytes, bytearray, dict)):
+            raise TypeError("objects must be an iterable of keys or conditional entries")
+        path = "/s3-admin/" + quote(bucket, safe="") + "/delete"
+        result = {"deleted": [], "errors": [], "deleted_count": 0, "success_count": 0}
+        iterator = iter(objects)
+        while batch := list(itertools.islice(iterator, 1000)):
+            page = _loads(await self._client.maintenance_json("POST", path, json.dumps({"objects": batch, "quiet": quiet})))
+            for field in ("deleted", "errors"):
+                result[field].extend(page[field])
+            for field in ("deleted_count", "success_count"):
+                result[field] += page[field]
+        return result
+
+    async def get_lifecycle(self, bucket: str) -> dict:
+        return _loads(await self._client.maintenance_json("GET", "/s3-admin/" + quote(bucket, safe="") + "/lifecycle"))
+
+    async def set_lifecycle(self, bucket: str, rules: list[dict]) -> dict:
+        """Replace expiration rules. Disabled rules are retained for later reuse."""
+        return _loads(await self._client.maintenance_json("PUT", "/s3-admin/" + quote(bucket, safe="") + "/lifecycle", json.dumps({"rules": rules})))
+
+    async def clear_lifecycle(self, bucket: str) -> dict:
+        return _loads(await self._client.maintenance_json("DELETE", "/s3-admin/" + quote(bucket, safe="") + "/lifecycle"))
+
+    async def preview_expiration(self, bucket: str, *, limit: int = 100, after_id: int = 0, include_disabled: bool = False) -> dict:
+        """Preview eligible objects without deletion; page using next_after_id."""
+        path = "/s3-admin/" + quote(bucket, safe="") + f"/lifecycle/preview?limit={limit}&after_id={after_id}&include_disabled={str(include_disabled).lower()}"
+        return _loads(await self._client.maintenance_json("POST", path))
+
+    async def bucket_usage(self, bucket: str) -> dict:
+        return _loads(await self._client.maintenance_json("GET", "/s3-admin/" + quote(bucket, safe="") + "/usage"))
+
+    async def set_bucket_quota(self, bucket: str, max_bytes: int) -> dict:
+        """Limit published logical bytes; 0 disables the quota."""
+        return _loads(await self._client.maintenance_json("PUT", "/s3-admin/" + quote(bucket, safe="") + "/usage", json.dumps({"max_bytes": max_bytes})))
+
+    async def storage_stats(self) -> dict:
+        return _loads(await self._client.maintenance_json("GET", "/s3-admin/stats"))
+
+    async def metrics(self) -> str:
+        """Return Prometheus text; storage gauges are periodically sampled."""
+        return await self._client.maintenance_json("GET", "/metrics")
+
+    async def ready(self) -> dict:
+        return _loads(await self._client.maintenance_json("GET", "/readyz"))
 
     async def health(self) -> dict:
         return _loads(await self._client.health_json())

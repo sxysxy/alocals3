@@ -592,3 +592,100 @@ Partial/state files use `.alocals3.part` and `.alocals3.json` suffixes next to t
 output; `.alocals3.lock` remains on disk to coordinate concurrent processes and its
 OS lock is released on exit. Explicit Range downloads stream and replace atomically
 but do not resume or validate the full-object digest. Upgrade client and server together.
+
+## 0.11.0: bulk deletion, expiration, capacity and monitoring
+
+Both Python clients support the following methods (remove `await` for sync):
+
+```python
+# Iterables are sent in batches of 1000 keys, each using one SQL transaction
+# and set-based SELECT/DELETE, rather than a request or commit per object.
+result = await client.delete_objects("bucket", keys, quiet=True)
+print(result["deleted_count"], result["errors"])
+# Entries may also be {"key": "tmp/result", "if_match": expected_etag}.
+
+# Save disabled rules, preview their effect, then enable them.
+rules = [{"id": "temp", "prefix": "tmp/", "expire_after_secs": 604800, "enabled": False}]
+await client.set_lifecycle("bucket", rules)
+page = await client.preview_expiration("bucket", include_disabled=True)
+# Further pages: after_id=page["next_after_id"], include_disabled=True.
+rules[0]["enabled"] = True
+await client.set_lifecycle("bucket", rules)
+
+await client.set_bucket_quota("bucket", 10 * 1024**3)  # 0 disables
+print(await client.bucket_usage("bucket"))
+print(await client.storage_stats())
+print(await client.metrics())
+print(await client.ready())
+```
+
+Bulk responses contain `deleted`, `errors`, `deleted_count` and `success_count`.
+Missing keys succeed idempotently; `deleted_count` counts actual removed rows,
+while `success_count` includes missing keys. Non-quiet successes contain key/existed;
+errors contain key/status/error. Invalid keys or mismatched ETags do not prevent
+other valid entries in the batch from succeeding. Database errors roll back the
+batch; earlier successful batches remain committed if a later client request fails.
+Blob reclamation runs in the background, respects GC grace and shared references,
+and is disabled by `--disable-gc`.
+
+Expiration rules are persisted per bucket. Each has a unique nonempty id, literal
+prefix (empty matches all), retention of 1 second to 100 years, and enabled flag
+(default true). Up to 100 rules are accepted. Any matching enabled rule may expire
+an object. Retention starts at the last publication/overwrite, including copies and
+multipart completion; reads do not refresh it. Rules apply to existing objects too.
+`get_lifecycle`, `set_lifecycle` and `clear_lifecycle` inspect, replace and clear rules.
+Previews are read-only, include enabled rules by default, and can include disabled
+rules explicitly. Paging uses `next_after_id`; it is not a cross-page snapshot.
+
+The default sweep interval is 60 seconds. Set `--lifecycle-interval-secs` /
+`ALOCALS3_LIFECYCLE_INTERVAL_SECS` to 0 to pause automatic expiration while retaining
+configuration/preview access. No objects expire without configured rules. Each sweep
+processes up to 10000 expired objects per bucket in bounded transactions; subsequent
+sweeps catch up. Expiration is asynchronous: objects remain readable until removed.
+A bucket write transaction protects selection/deletion against concurrent overwrites.
+Disabling rules does not recover previously deleted objects.
+
+Bucket usage returns object_count/logical_bytes/max_bytes/pending_part_bytes. Quotas
+are unlimited by default and count published logical bytes per key, including each
+reference to a deduplicated blob. Pending parts are separate from published quota
+and remain subject to disk protection. Transactional database triggers maintain
+counts without a per-write bucket scan and enforce quotas on PUT, overwrite, copy
+and multipart publication. Violations return 507 and roll back publication/counters.
+Shrinking objects and deleting data remain possible after lowering a quota below usage.
+
+`--min-free-bytes` / `ALOCALS3_MIN_FREE_BYTES` defaults to 256 MiB (0 disables).
+Upload reception, part reception and assembly coordinate chunk writes across
+processes sharing the storage root, checking the free-space floor before writing.
+Assembly requires temporary space in addition to its existing parts; failure preserves
+retriable parts. Use consistent reserve settings across processes. Other programs
+can still consume the same disk. Physical bytes are not the same as logical quota:
+orphan blobs, temporary files and uncollected deletions still occupy disk.
+
+On first upgrade, usage/lifecycle tables, indexes and accounting triggers are added;
+existing metadata is read to initialize counters. PostgreSQL briefly blocks object
+writes while installing triggers.
+
+HTTP endpoints use the alocals3 JSON protocol and service authentication:
+
+| Endpoint | Body / result |
+| --- | --- |
+| `POST /s3-admin/{bucket}/delete` | `{"objects":["key",{"key":"other","if_match":"etag"}],"quiet":true}`; up to 1000 entries |
+| `GET/PUT/DELETE /s3-admin/{bucket}/lifecycle` | PUT `{"rules":[...]}` |
+| `POST /s3-admin/{bucket}/lifecycle/preview?limit=100&after_id=0&include_disabled=true` | objects, is_truncated, next_after_id |
+| `GET/PUT /s3-admin/{bucket}/usage` | PUT `{"max_bytes":10737418240}` |
+| `GET /s3-admin/stats` | Immediate global usage, pending bytes, filesystem space and sample timestamp |
+| `GET /metrics` | Prometheus text; Bearer service credential when authentication is enabled |
+| `GET /readyz` | Public DB/free-space readiness; 503 when unavailable |
+
+`/healthz` retains its public liveness/identity behavior even when low space prevents
+uploads. Every HTTP response includes `x-request-id`. Metrics include request counts,
+response-header latency histograms, actual streaming body bytes, pending-header
+requests, bulk/expiration counters and storage gauges. Labels use method, matched
+route template and status, never object keys or credentials. Header latency does not
+measure complete large-file transfer time.
+
+Storage gauges are cached every 15 seconds (`--metrics-interval-secs` /
+`ALOCALS3_METRICS_INTERVAL_SECS`, effective minimum 1); `storage_stats()` refreshes
+immediately. Filesystem capacity/free bytes cover the whole filesystem, including
+other applications. Request counters belong to the current process and reset on
+restart; do not sum shared-storage gauges across server processes.

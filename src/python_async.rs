@@ -254,6 +254,30 @@ impl RustHttpClientAsync {
         )
     }
 
+    #[pyo3(signature = (method, path, body=None))]
+    fn maintenance_json<'py>(
+        &self,
+        py: Python<'py>,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if !path.starts_with('/') {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "path must be absolute",
+            ));
+        }
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("invalid method"))?;
+        let mut request = self.inner.client.request(method, self.inner.url(path));
+        if let Some(body) = body {
+            request = request
+                .header(CONTENT_TYPE, "application/json")
+                .body(body.to_owned());
+        }
+        self.request_json(py, request)
+    }
+
     fn health_json<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.request_json(py, self.inner.client.get(self.inner.url("/healthz")))
     }

@@ -1,6 +1,7 @@
 # Version 0.11.1
 
 - Add ThirdpartyLicense.txt with third-party Rust and Python license texts and notices; include it in release packages.
+- Strip the binaries and enable LTO.
 
 # Version 0.11.0
 

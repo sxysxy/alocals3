@@ -5,6 +5,10 @@ edition = "2021"
 rust-version = "1.89"
 authors = ["HfCloud(sxysxygm@gmail.com)"]
 
+[profile.release]
+strip = "symbols"
+lto = true
+
 [lib]
 name = "_alocals3_native"
 crate-type = ["cdylib", "rlib"]

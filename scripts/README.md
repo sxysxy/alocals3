@@ -2,6 +2,11 @@
 
 These scripts build the Rust server binary and the Python wheel.
 
+Release builds strip symbols through `[profile.release] strip = "symbols"` in
+`Cargo.toml`. This applies to the server, migration CLI, and Python native
+extension before packaging, including the binaries bundled in wheels.
+For a release build that retains symbols, set `CARGO_PROFILE_RELEASE_STRIP=none`.
+
 ## Python Wheel ABI
 
 The wheel is configured for Python 3.12+ with PyO3 limited ABI:

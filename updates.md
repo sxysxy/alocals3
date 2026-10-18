@@ -1,3 +1,7 @@
+# Version 0.11.1
+
+- Add ThirdpartyLicense.txt with third-party Rust and Python license texts and notices; include it in release packages.
+
 # Version 0.11.0
 
 - Add object bulk deletion with one bucket transaction and set-based SQL per 1000-key batch; clients automatically batch iterables and support quiet responses and per-object ETag conditions.

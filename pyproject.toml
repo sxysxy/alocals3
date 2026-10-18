@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "alocals3"
-version = "0.11.0"
+version = "0.11.1"
 description = "alocals3: a Rust S3-like server and Rust-backed Python client"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -44,6 +44,7 @@ include = [
   "README.md",
   "README.zh-CN.md",
   "LICENSE",
+  "ThirdpartyLicense.txt",
 ]
 exclude = [
   "alocals3/_alocals3_native*.so",

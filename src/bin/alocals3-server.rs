@@ -399,6 +399,15 @@ impl ApiError {
     }
 }
 
+impl From<http::header::InvalidHeaderValue> for ApiError {
+    fn from(err: http::header::InvalidHeaderValue) -> Self {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Invalid response header value: {err}"),
+        )
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.status, self.detail).into_response()
@@ -786,7 +795,11 @@ async fn main() -> anyhow::Result<()> {
         ))
     };
     let capacity = Arc::new(capacity::Capacity::new(
-        storage.objects_root().parent().unwrap().to_owned(),
+        storage
+            .objects_root()
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Objects directory has no parent"))?
+            .to_owned(),
         args.min_free_bytes,
     ));
     let state = AppState {
@@ -1043,7 +1056,7 @@ async fn put_object(
         };
         response.headers_mut().insert(
             header::ETAG,
-            HeaderValue::from_str(&format!("\"{}\"", info.etag)).unwrap(),
+            HeaderValue::from_str(&format!("\"{}\"", info.etag))?,
         );
         return Ok(response);
     }
@@ -1092,7 +1105,7 @@ async fn put_object(
         .into_response();
     response.headers_mut().insert(
         header::ETAG,
-        HeaderValue::from_str(&format!("\"{}\"", info.etag)).unwrap(),
+        HeaderValue::from_str(&format!("\"{}\"", info.etag))?,
     );
     Ok(response)
 }
@@ -1119,7 +1132,7 @@ async fn get_public_object(
     let mut source = state.storage.get_object_source(&bucket, &key).await?;
     let object_version = source.info.etag.clone();
     if query.version.as_deref() != Some(object_version.as_str()) {
-        return Ok(public_object_version_redirect(&uri, &object_version));
+        return public_object_version_redirect(&uri, &object_version);
     }
     let lower_key = source.info.key.to_ascii_lowercase();
     source.info.content_type =
@@ -1188,7 +1201,7 @@ async fn head_public_object(
         .await?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Object not found"))?;
     if query.version.as_deref() != Some(info.etag.as_str()) {
-        return Ok(public_object_version_redirect(&uri, &info.etag));
+        return public_object_version_redirect(&uri, &info.etag);
     }
     let lower_key = info.key.to_ascii_lowercase();
     info.content_type = public_content_type(&lower_key, &info.content_type).to_string();
@@ -1300,11 +1313,11 @@ fn sanitize_terrain_layer_json(body: &mut Vec<u8>) {
     }
 }
 
-fn public_object_version_redirect(uri: &http::Uri, version: &str) -> Response {
+fn public_object_version_redirect(uri: &http::Uri, version: &str) -> ApiResult<Response> {
     let mut response = StatusCode::TEMPORARY_REDIRECT.into_response();
     response.headers_mut().insert(
         header::LOCATION,
-        HeaderValue::from_str(&format!("{}?version={version}", uri.path())).unwrap(),
+        HeaderValue::from_str(&format!("{}?version={version}", uri.path()))?,
     );
     // Never cache the path-only redirect: the object assigned to a bucket/key
     // can change, in which case the canonical versioned URL changes with it.
@@ -1316,7 +1329,7 @@ fn public_object_version_redirect(uri: &http::Uri, version: &str) -> Response {
         header::VARY,
         HeaderValue::from_static("Authorization, Cookie"),
     );
-    response
+    Ok(response)
 }
 
 fn apply_public_object_headers(response: &mut Response, terrain_gzip: bool) {
@@ -2390,7 +2403,7 @@ async fn stream_object_response(
     );
     response_headers.insert(
         header::ETAG,
-        HeaderValue::from_str(&format!("\"{}\"", source.info.etag)).unwrap(),
+        HeaderValue::from_str(&format!("\"{}\"", source.info.etag))?,
     );
     insert_user_metadata_headers(&mut response_headers, &source.info.metadata)?;
     response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
@@ -2422,7 +2435,7 @@ async fn stream_object_response(
             let (start, end) = parse_range(range_header, body_len)?;
             response_headers.insert(
                 header::CONTENT_RANGE,
-                HeaderValue::from_str(&format!("bytes {start}-{end}/{body_len}")).unwrap(),
+                HeaderValue::from_str(&format!("bytes {start}-{end}/{body_len}"))?,
             );
             (StatusCode::PARTIAL_CONTENT, start, end - start + 1)
         } else {
@@ -2430,7 +2443,7 @@ async fn stream_object_response(
         };
     response_headers.insert(
         header::CONTENT_LENGTH,
-        HeaderValue::from_str(&response_len.to_string()).unwrap(),
+        HeaderValue::from_str(&response_len.to_string())?,
     );
     response_headers.insert(
         header::CONTENT_TYPE,
@@ -2469,7 +2482,7 @@ fn object_response(
     );
     response_headers.insert(
         header::ETAG,
-        HeaderValue::from_str(&format!("\"{}\"", obj.info.etag)).unwrap(),
+        HeaderValue::from_str(&format!("\"{}\"", obj.info.etag))?,
     );
     insert_user_metadata_headers(&mut response_headers, &obj.info.metadata)?;
     response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
@@ -2500,11 +2513,11 @@ fn object_response(
         let partial = obj.body[start..=end].to_vec();
         response_headers.insert(
             header::CONTENT_RANGE,
-            HeaderValue::from_str(&format!("bytes {start}-{end}/{body_len}")).unwrap(),
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{body_len}"))?,
         );
         response_headers.insert(
             header::CONTENT_LENGTH,
-            HeaderValue::from_str(&partial.len().to_string()).unwrap(),
+            HeaderValue::from_str(&partial.len().to_string())?,
         );
         response_headers.insert(
             header::CONTENT_TYPE,
@@ -2519,7 +2532,7 @@ fn object_response(
 
     response_headers.insert(
         header::CONTENT_LENGTH,
-        HeaderValue::from_str(&body_len.to_string()).unwrap(),
+        HeaderValue::from_str(&body_len.to_string())?,
     );
     response_headers.insert(
         header::CONTENT_TYPE,
@@ -2541,7 +2554,7 @@ fn object_head_response(info: ObjectInfo, headers: &HeaderMap) -> ApiResult<Resp
     );
     response_headers.insert(
         header::ETAG,
-        HeaderValue::from_str(&format!("\"{}\"", info.etag)).unwrap(),
+        HeaderValue::from_str(&format!("\"{}\"", info.etag))?,
     );
     insert_user_metadata_headers(&mut response_headers, &info.metadata)?;
     response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
@@ -2576,18 +2589,18 @@ fn object_head_response(info: ObjectInfo, headers: &HeaderMap) -> ApiResult<Resp
         let (start, end) = parse_range(range_header, body_len)?;
         response_headers.insert(
             header::CONTENT_RANGE,
-            HeaderValue::from_str(&format!("bytes {start}-{end}/{body_len}")).unwrap(),
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{body_len}"))?,
         );
         response_headers.insert(
             header::CONTENT_LENGTH,
-            HeaderValue::from_str(&(end - start + 1).to_string()).unwrap(),
+            HeaderValue::from_str(&(end - start + 1).to_string())?,
         );
         return Ok((StatusCode::PARTIAL_CONTENT, response_headers).into_response());
     }
 
     response_headers.insert(
         header::CONTENT_LENGTH,
-        HeaderValue::from_str(&body_len.to_string()).unwrap(),
+        HeaderValue::from_str(&body_len.to_string())?,
     );
     Ok((StatusCode::OK, response_headers).into_response())
 }
@@ -3115,6 +3128,58 @@ impl From<std::io::Error> for ApiError {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn invalid_stored_etag_returns_server_error() {
+        let info = ObjectInfo {
+            bucket: "test-bucket".into(),
+            key: "object".into(),
+            size: 0,
+            content_type: "application/octet-stream".into(),
+            etag: "invalid\r\netag".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            metadata: HashMap::new(),
+        };
+        let headers = HeaderMap::new();
+        let head = object_head_response(info.clone(), &headers);
+        let buffered = object_response(
+            StoredObject {
+                info: info.clone(),
+                body: Vec::new(),
+            },
+            &headers,
+            true,
+        );
+        let streamed = stream_object_response(
+            StoredObjectSource {
+                info,
+                path: PathBuf::new(),
+                size: 0,
+            },
+            &headers,
+        )
+        .await;
+        for result in [head, buffered, streamed] {
+            let Err(error) = result else {
+                panic!("invalid stored ETag must be rejected");
+            };
+            assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(error.detail.starts_with("Invalid response header value:"));
+            assert_eq!(
+                error.into_response().status(),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_redirect_version_returns_server_error() {
+        let uri = http::Uri::from_static("/api/object/bucket/key");
+        let Err(error) = public_object_version_redirect(&uri, "invalid\nversion") else {
+            panic!("invalid redirect version must be rejected");
+        };
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     fn user_token(secret: &str, expires: u64) -> String {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(format!("tester|user|{expires}|nonce"));
@@ -3159,7 +3224,8 @@ mod tests {
         let uri = "/api/object/models/system/structure/models/model.glb"
             .parse::<http::Uri>()
             .unwrap();
-        let redirect = public_object_version_redirect(&uri, "abc123");
+        let redirect = public_object_version_redirect(&uri, "abc123")
+            .expect("valid version should produce a redirect");
         assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(
             redirect.headers()[header::LOCATION],

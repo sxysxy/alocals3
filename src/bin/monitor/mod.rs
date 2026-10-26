@@ -58,7 +58,10 @@ pub(super) async fn middleware(
         _ => "OTHER",
     }
     .to_owned();
-    let request_id = HeaderValue::from_str(&Uuid::new_v4().simple().to_string()).unwrap();
+    let request_id = match HeaderValue::from_str(&Uuid::new_v4().simple().to_string()) {
+        Ok(value) => value,
+        Err(err) => return ApiError::from(err).into_response(),
+    };
     state
         .monitor
         .inflight_headers

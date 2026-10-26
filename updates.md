@@ -1,3 +1,7 @@
+# Version 0.11.2
+
+- Return explicit errors instead of panicking when response headers or the storage parent path are invalid.
+
 # Version 0.11.1
 
 - Add ThirdpartyLicense.txt with third-party Rust and Python license texts and notices; include it in release packages.

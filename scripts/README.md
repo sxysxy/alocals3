@@ -3,8 +3,10 @@
 These scripts build the Rust server binary and the Python wheel.
 
 Release builds strip symbols through `[profile.release] strip = "symbols"` in
-`Cargo.toml`. This applies to the server, migration CLI, and Python native
-extension before packaging, including the binaries bundled in wheels.
+`Cargo.toml` on Linux and Windows. This applies to the server, migration CLI,
+and Python native extension before packaging, including bundled binaries.
+On macOS, `.cargo/config.toml` disables Rust stripping to avoid misaligned
+Mach-O LINKEDIT string pools rejected by macOS 27 (Rust issue #157750).
 For a release build that retains symbols, set `CARGO_PROFILE_RELEASE_STRIP=none`.
 
 ## Python Wheel ABI
@@ -120,3 +122,17 @@ Useful overrides:
 ```bash
 PYTHON=python3.12 scripts/build-macos-release.sh
 ```
+
+The macOS script checks the LINKEDIT string pool alignment in the packaged wheel
+and standalone binaries. To check an existing wheel manually:
+
+```bash
+python3 scripts/check-macos-linkedit.py dist/alocals3-*-macosx_*.whl
+```
+
+If importing `_alocals3_native.abi3.so` fails with `mis-aligned LINKEDIT string
+pool`, rebuild and reinstall the wheel; reinstalling the same old wheel will not
+repair it. Do not pass maturin `--strip`. Custom `RUSTFLAGS` or
+`CARGO_ENCODED_RUSTFLAGS` override Cargo's target flags, so they must also include
+`-C strip=none` on macOS. The Cargo config is included in source distributions
+so source installs receive the same workaround.

@@ -46,14 +46,21 @@ chmod +x "$ROOT_DIR/alocals3/bin/alocals3-server"
 chmod +x "$ROOT_DIR/alocals3/bin/alocals3-migrate2pg"
 
 echo "==> Building macOS cp312 abi3 wheel for $TARGET"
-"$PYTHON" -m pip install --upgrade "maturin>=1.7,<2"
+"$PYTHON" -m pip install --upgrade "maturin>=1.9.3,<2"
+WHEEL_DIR="$(mktemp -d)"
+trap 'rm -rf "$WHEEL_DIR"' EXIT
 "$PYTHON" -m maturin build \
   --release \
   --locked \
   --features extension-module \
   --interpreter "$PYTHON" \
   --target "$TARGET" \
-  --out "$OUT_DIR"
+  --out "$WHEEL_DIR"
+
+echo "==> Checking Mach-O LINKEDIT alignment"
+"$PYTHON" scripts/check-macos-linkedit.py \
+  "$SERVER_DST" "$MIGRATE_DST" "$WHEEL_DIR"/*.whl
+mv "$WHEEL_DIR"/*.whl "$OUT_DIR/"
 
 echo "==> Artifact metadata"
 file "$SERVER_DST" "$MIGRATE_DST"

@@ -1,3 +1,8 @@
+# Version 0.11.3
+
+- Disable Rust symbol stripping on macOS to fix native extension imports rejected by macOS 27 due to misaligned LINKEDIT string pools.
+- Validate Mach-O string pool alignment in macOS release binaries and wheels, and include the Cargo workaround in source distributions.
+
 # Version 0.11.2
 
 - Return explicit errors instead of panicking when response headers or the storage parent path are invalid.

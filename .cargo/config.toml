@@ -1,0 +1,5 @@
+# Rust's Mach-O strip can misalign LC_SYMTAB.stroff, which macOS 27 rejects.
+# Keep this target-specific so Linux and Windows retain release symbol stripping.
+# https://github.com/rust-lang/rust/issues/157750
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "strip=none"]
